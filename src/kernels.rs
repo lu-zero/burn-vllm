@@ -551,6 +551,52 @@ fn row_dot(
 // One plane per output row; grid: (row groups folded over x/y, ceil(M / maxm) in z).
 // ---------------------------------------------------------------------------
 
+/// Q8_0 for several activation rows with `rpp` weight rows per plane: each x vec4 load is
+/// reused across `rpp` rows (the plain path is L1-load bound once maxm > 1).
+#[cube]
+fn row_dot_q8_rows(
+    w0v: &[V4u],
+    w1: &[u32],
+    xv: &[V4f],
+    row0: usize,
+    n: usize,
+    k: usize,
+    xrow: &Array<usize>,
+    acc: &mut Array<f32>,
+    #[comptime] maxm: usize,
+    #[comptime] rpp: usize,
+) {
+    let lane = UNIT_POS_PLANE as usize;
+    let nl = PLANE_DIM as usize;
+    let vecs = (k / 32) * 2;
+    let mut u = lane;
+    while u < vecs {
+        let xo = u * 4;
+        #[unroll]
+        for r in 0..rpp {
+            let row = min(row0 + r, n - 1);
+            let vi = row * vecs + u;
+            let b = vi / 2;
+            let d = f16_to_f32((w1[b / 2] >> (((b % 2) * 16) as u32)) & 0xFFFF);
+            let wv = w0v[vi];
+            let mut vals = Array::<f32>::new(16usize);
+            #[unroll]
+            for wi in 0..4usize {
+                let w = wv.extract(wi);
+                #[unroll]
+                for j in 0..4usize {
+                    vals[wi * 4 + j] = sext8((w >> comptime!((j * 8) as u32)) & 0xFF);
+                }
+            }
+            #[unroll]
+            for mi in 0..maxm {
+                acc[r * maxm + mi] += d * dot16(&vals, 0usize, xv, xrow[mi] + xo);
+            }
+        }
+        u += nl;
+    }
+}
+
 #[cube(launch)]
 pub fn qmatmul(
     w0: &[u32],
@@ -563,36 +609,50 @@ pub fn qmatmul(
     m: u32,
     #[comptime] fmt: u32,
     #[comptime] maxm: usize,
+    #[comptime] rpp: usize,
     #[comptime] accumulate: bool,
 ) {
     let lut = mxfp4_lut();
     let rows_per_cube = (CUBE_DIM / PLANE_DIM) as usize;
-    let row = folded_cube() * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize;
+    let row0 = (folded_cube() * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize) * rpp;
     let n = n as usize;
     let k = k as usize;
     let m0 = CUBE_POS_Z as usize * maxm;
     let cnt = min(maxm, m as usize - m0);
-    let mut acc = Array::<f32>::new(maxm);
+    let mut acc = Array::<f32>::new(maxm * rpp);
     let mut xrow = Array::<usize>::new(maxm);
     #[unroll]
-    for mi in 0..maxm {
-        acc[mi] = 0.0;
-        xrow[mi] = (m0 + mi) * (k / 4);
+    for i in 0..maxm * rpp {
+        acc[i] = 0.0;
     }
-    if row < n {
+    // Rows past `m` alias the last real row so the inner loops run branch-free (`maxm`);
+    // their results are discarded at the store.
+    #[unroll]
+    for mi in 0..maxm {
+        xrow[mi] = min(m0 + mi, m as usize - 1) * (k / 4);
+    }
+    if comptime!(rpp > 1) {
+        if row0 < n {
+            row_dot_q8_rows(w0v, w1, xv, row0, n, k, &xrow, &mut acc, maxm, rpp);
+        }
+    } else if row0 < n {
         row_dot(
-            w0, w0v, w1, &lut, xv, row, k, &xrow, cnt, &mut acc, fmt, maxm,
+            w0, w0v, w1, &lut, xv, row0, k, &xrow, maxm, &mut acc, fmt, maxm,
         );
     }
     #[unroll]
-    for mi in 0..maxm {
-        let s = plane_sum(acc[mi]);
-        if row < n && UNIT_POS_PLANE == 0 && mi < cnt {
-            let o = (m0 + mi) * n + row;
-            if comptime!(accumulate) {
-                out[o] += s;
-            } else {
-                out[o] = s;
+    for r in 0..rpp {
+        #[unroll]
+        for mi in 0..maxm {
+            let s = plane_sum(acc[r * maxm + mi]);
+            let row = row0 + r;
+            if row < n && UNIT_POS_PLANE == 0 && mi < cnt {
+                let o = (m0 + mi) * n + row;
+                if comptime!(accumulate) {
+                    out[o] += s;
+                } else {
+                    out[o] = s;
+                }
             }
         }
     }
@@ -662,8 +722,19 @@ pub fn swiglu(g: &[f32], u: &[f32], out: &mut [f32], n: u32) {
 
 /// Causal depthwise conv1d (kernel 4) + SiLU with a rolling 3-step state.
 /// x: [T, C], w: [C, 4], state: [3, C] (oldest first), out: [T, C]. One unit per channel.
+/// With `save`, `snap[ti]` ([3, C] each) receives the state after token `ti` for every
+/// `ti < t - 1` (speculative-decoding rollback).
 #[cube(launch)]
-pub fn gdn_conv(x: &[f32], w: &[f32], state: &mut [f32], out: &mut [f32], c: u32, t: u32) {
+pub fn gdn_conv(
+    x: &[f32],
+    w: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    snap: &mut [f32],
+    c: u32,
+    t: u32,
+    #[comptime] save: bool,
+) {
     let ch = ABSOLUTE_POS as usize;
     let c = c as usize;
     if ch < c {
@@ -681,10 +752,42 @@ pub fn gdn_conv(x: &[f32], w: &[f32], state: &mut [f32], out: &mut [f32], c: u32
             h0 = h1;
             h1 = h2;
             h2 = v;
+            if comptime!(save) {
+                if ti + 1 < t as usize {
+                    snap[ti * 3 * c + ch] = h0;
+                    snap[ti * 3 * c + c + ch] = h1;
+                    snap[ti * 3 * c + 2 * c + ch] = h2;
+                }
+            }
         }
         state[ch] = h0;
         state[c + ch] = h1;
         state[2 * c + ch] = h2;
+    }
+}
+
+/// dst[i] = src[src_off + i] for i < n.
+#[cube(launch)]
+pub fn copy_f32(dst: &mut [f32], src: &[f32], src_off: u32, n: u32) {
+    let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
+    if i < n as usize {
+        dst[i] = src[src_off as usize + i];
+    }
+}
+
+/// out[r, :] = [a[r, :], b[r, :]] over rows of width d (out rows are 2d wide).
+#[cube(launch)]
+pub fn concat_rows(a: &[f32], b: &[f32], out: &mut [f32], d: u32, total: u32) {
+    let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
+    if i < total as usize {
+        let d = d as usize;
+        let r = i / (2 * d);
+        let j = i % (2 * d);
+        if j < d {
+            out[i] = a[r * d + j];
+        } else {
+            out[i] = b[r * d + j - d];
+        }
     }
 }
 
@@ -704,11 +807,13 @@ pub fn gdn_recurrent(
     norm_w: &[f32],
     state: &mut [f32],
     out: &mut [f32],
+    snap: &mut [f32],
     t: u32,
     nk: u32,
     nv: u32,
     eps: f32,
     #[comptime] dk: usize,
+    #[comptime] save: bool,
 ) {
     let mut smem = Shared::<[f32]>::new_slice(MAX_PLANES);
     let mut qs = Shared::<[f32]>::new_slice(dk);
@@ -766,6 +871,14 @@ pub fn gdn_recurrent(
         let zj = z[ti * nv * dv + h * dv + j];
         out[ti * nv * dv + h * dv + j] =
             o / f32::sqrt(on / f32::cast_from(dv) + eps) * wj * silu(zj);
+        if comptime!(save) {
+            if ti + 1 < t as usize {
+                #[unroll]
+                for i in 0..dk {
+                    snap[ti * nv * dk * dv + sbase + i * dv + j] = s[i];
+                }
+            }
+        }
     }
     #[unroll]
     for i in 0..dk {

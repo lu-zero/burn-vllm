@@ -27,6 +27,8 @@ const USAGE: &str = "usage: burn-vllm [options] [--prompt TEXT]
   --chunk N             prefill chunk size (default 512)
   --vram-gb F           VRAM budget used to size the expert cache
   --expert-slots N      experts kept on device per layer (256 = all resident)
+  --mtp K               speculative decoding: draft K tokens per step with the model's
+                        MTP head (needs a GGUF that includes the nextn block)
   --selftest            check GPU kernels against CPU references and exit
   --bench               time decode-shaped kernels and exit";
 
@@ -42,6 +44,7 @@ struct Args {
     chunk: usize,
     vram_gb: Option<f64>,
     expert_slots: Option<usize>,
+    mtp: usize,
     selftest: bool,
     bench: bool,
 }
@@ -59,6 +62,7 @@ fn parse_args() -> Result<Args> {
         chunk: 512,
         vram_gb: None,
         expert_slots: None,
+        mtp: 0,
         selftest: false,
         bench: false,
     };
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args> {
             "--chunk" => a.chunk = val()?.parse()?,
             "--vram-gb" => a.vram_gb = Some(val()?.parse()?),
             "--expert-slots" => a.expert_slots = Some(val()?.parse()?),
+            "--mtp" => a.mtp = val()?.parse()?,
             "--selftest" => a.selftest = true,
             "--bench" => a.bench = true,
             "-h" | "--help" => {
@@ -132,6 +137,7 @@ fn main() -> Result<()> {
         expert_slots: args.expert_slots,
         vram_budget: args.vram_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
         max_ctx: args.ctx,
+        spec_k: args.mtp,
     };
     let mut model = model::Model::load(gpu, gguf, &opts)?;
 
@@ -156,25 +162,39 @@ fn main() -> Result<()> {
         .collect();
     eprintln!("prompt: {} tokens", prompt.len());
 
-    let mut st = model.new_state(args.ctx);
+    let spec_k = if model.has_mtp() { args.mtp } else { 0 };
+    if args.mtp > 0 && !model.has_mtp() {
+        eprintln!("warning: --mtp needs a GGUF with an MTP (nextn) block; ignoring");
+    }
+    let mut st = model.new_state(args.ctx, spec_k);
     let mut sampler = sampler::Sampler::new(args.sampling.clone());
     let t0 = Instant::now();
     let mut logits = Vec::new();
-    for chunk in prompt.chunks(args.chunk.max(1)) {
-        logits = model.forward(chunk, &mut st)?;
+    let mut h_prev = None;
+    if spec_k > 0 {
+        let (l, h) = model.prefill_spec(&prompt, args.chunk, &mut st)?;
+        logits = l;
+        h_prev = Some(h);
+    } else {
+        for chunk in prompt.chunks(args.chunk.max(1)) {
+            logits = model.forward(chunk, &mut st)?;
+        }
     }
     let prefill = t0.elapsed().as_secs_f64();
     let stats0 = model.stats.clone();
+    if let Some(p) = model.prof.summary() {
+        eprintln!("after prefill: {p}");
+    }
 
     print!("{text}");
     let mut out_bytes = Vec::new();
     let mut printed = 0;
     let t1 = Instant::now();
     let mut generated = 0;
-    for _ in 0..args.n {
-        let next = sampler.sample(&logits);
+    // Emits one token; returns true when it is a stop token (not emitted).
+    let mut emit = |next: u32| -> Result<bool> {
         if stop.contains(&next) {
-            break;
+            return Ok(true);
         }
         generated += 1;
         out_bytes.extend(tok.token_bytes(next));
@@ -189,10 +209,59 @@ fn main() -> Result<()> {
         );
         std::io::stdout().flush()?;
         printed += valid;
-        if st.pos >= args.ctx {
-            break;
+        Ok(false)
+    };
+    let (mut cycles, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+    if spec_k > 0 {
+        let mut pending = sampler.sample(&logits);
+        let mut emitted = 0usize;
+        while emitted < args.n {
+            if emit(pending)? {
+                break;
+            }
+            emitted += 1;
+            if emitted >= args.n || st.pos + spec_k + 1 >= args.ctx {
+                break;
+            }
+            let out = model.spec_step(
+                &mut st,
+                pending,
+                h_prev.as_ref().unwrap(),
+                spec_k,
+                &mut sampler,
+            )?;
+            cycles += 1;
+            drafted += out.drafted;
+            accepted += out.accepted.len();
+            let mut stopped = false;
+            for d in out.accepted {
+                if emitted >= args.n || emit(d)? {
+                    stopped = true;
+                    break;
+                }
+                emitted += 1;
+            }
+            if stopped {
+                break;
+            }
+            pending = out.next;
+            h_prev = Some(out.hidden);
         }
-        logits = model.forward(&[next], &mut st)?;
+    } else {
+        for _ in 0..args.n {
+            let next = sampler.sample(&logits);
+            if emit(next)? || st.pos >= args.ctx {
+                break;
+            }
+            logits = model.forward(&[next], &mut st)?;
+        }
+    }
+    drop(emit);
+    if spec_k > 0 {
+        eprintln!(
+            "spec: {cycles} steps, {accepted}/{drafted} drafts accepted ({:.2} tokens/step)",
+            (accepted + cycles) as f64 / cycles.max(1) as f64
+        );
     }
     println!();
     let decode = t1.elapsed().as_secs_f64();

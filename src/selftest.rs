@@ -84,14 +84,16 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
         let st = gpu.zeros(3 * c);
         let w = gpu.upload_f32(&rng.vec(4 * c));
         time("gdn conv t=1", 200, &mut || {
-            drop(gpu.gdn_conv(&conv, &w, &st, c, 1))
+            drop(gpu.gdn_conv(&conv, &w, &st, None, c, 1))
         });
         let a = gpu.upload_f32(&rng.vec(nv));
         let z = gpu.upload_f32(&rng.vec(nv * dk));
         let s = gpu.zeros(nv * dk * dk);
         let nw = gpu.upload_f32(&rng.vec(dk));
         time("gdn recurrent t=1", 200, &mut || {
-            drop(gpu.gdn_recurrent(&conv, &a, &a, &z, &a, &a, &nw, &s, 1, nk, nv, dk, 1e-6))
+            drop(gpu.gdn_recurrent(
+                &conv, &a, &a, &z, &a, &a, &nw, &s, None, 1, nk, nv, dk, 1e-6,
+            ))
         });
     }
     {
@@ -667,6 +669,7 @@ fn gdn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
         &gpu.upload_f32(&x),
         &gpu.upload_f32(&conv_w),
         &state_b,
+        None,
         c,
         t,
     );
@@ -682,6 +685,7 @@ fn gdn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
         &gpu.upload_f32(&dt_bias),
         &gpu.upload_f32(&norm_w),
         &ssm_b,
+        None,
         t,
         nk,
         nv,
@@ -690,6 +694,64 @@ fn gdn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
     );
     check("gdn recurrent out", &gpu.read_f32(&o), &out, 1e-4)?;
     check("gdn recurrent state", &gpu.read_f32(&ssm_b), &s, 1e-4)?;
+    // Rollback snapshots: the state saved after token j must equal running tokens 0..=j alone.
+    let csnap = gpu.alloc((t - 1) * 3 * c);
+    let ssnap = gpu.alloc((t - 1) * nv * dk * dk);
+    let (xb, wb) = (gpu.upload_f32(&x), gpu.upload_f32(&conv_w));
+    let conv_s = gpu.gdn_conv(&xb, &wb, &gpu.upload_f32(&state0), Some(&csnap), c, t);
+    check("gdn conv (snap)", &gpu.read_f32(&conv_s), &conv, 1e-5)?;
+    let _ = gpu.gdn_recurrent(
+        &conv_s,
+        &gpu.upload_f32(&alpha),
+        &gpu.upload_f32(&beta),
+        &gpu.upload_f32(&z),
+        &gpu.upload_f32(&ssm_a),
+        &gpu.upload_f32(&dt_bias),
+        &gpu.upload_f32(&norm_w),
+        &gpu.upload_f32(&s0),
+        Some(&ssnap),
+        t,
+        nk,
+        nv,
+        dk,
+        eps,
+    );
+    let (csnap_h, ssnap_h) = (gpu.read_f32(&csnap), gpu.read_f32(&ssnap));
+    for n in 1..t {
+        let stn = gpu.upload_f32(&state0);
+        let cn = gpu.gdn_conv(&gpu.upload_f32(&x[..n * c]), &wb, &stn, None, c, n);
+        let ssn = gpu.upload_f32(&s0);
+        let _ = gpu.gdn_recurrent(
+            &cn,
+            &gpu.upload_f32(&alpha[..n * nv]),
+            &gpu.upload_f32(&beta[..n * nv]),
+            &gpu.upload_f32(&z[..n * nv * dk]),
+            &gpu.upload_f32(&ssm_a),
+            &gpu.upload_f32(&dt_bias),
+            &gpu.upload_f32(&norm_w),
+            &ssn,
+            None,
+            n,
+            nk,
+            nv,
+            dk,
+            eps,
+        );
+        let cs = 3 * c;
+        let ss = nv * dk * dk;
+        check(
+            &format!("gdn conv snapshot {n}"),
+            &csnap_h[(n - 1) * cs..n * cs],
+            &gpu.read_f32(&stn),
+            1e-6,
+        )?;
+        check(
+            &format!("gdn recurrent snapshot {n}"),
+            &ssnap_h[(n - 1) * ss..n * ss],
+            &gpu.read_f32(&ssn),
+            1e-6,
+        )?;
+    }
     Ok(())
 }
 

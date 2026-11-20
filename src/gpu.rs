@@ -53,6 +53,8 @@ pub struct Gpu {
     pub client: Client,
     pub device: CubeDevice,
     pub plane: u32,
+    /// Placeholder for kernel arguments a comptime flag leaves unused.
+    dummy: Buf,
 }
 
 /// Split a 1-D cube count over (x, y) to respect per-dimension grid limits.
@@ -84,10 +86,15 @@ impl Gpu {
         let client = device.client();
         let hw = &client.properties().hardware;
         let plane = hw.plane_size_max.max(hw.plane_size_min).max(8);
+        let dummy = Buf {
+            h: client.empty(4),
+            len: 1,
+        };
         Self {
             client,
             device,
             plane,
+            dummy,
         }
     }
 
@@ -167,7 +174,8 @@ impl Gpu {
             1
         };
         let (threads, rows) = self.rows_cube();
-        let (gx, gy) = fold((w.n as u32).div_ceil(rows));
+        let rpp = if w.fmt == 1 && maxm >= 2 { 4usize } else { 1 };
+        let (gx, gy) = fold((w.n as u32).div_ceil(rows * rpp as u32));
         let gz = (m as u32).div_ceil(maxm as u32);
         kernels::qmatmul::launch(
             &self.client,
@@ -183,6 +191,7 @@ impl Gpu {
             m as u32,
             w.fmt,
             maxm,
+            rpp,
             accumulate,
         );
     }
@@ -300,7 +309,16 @@ impl Gpu {
         out
     }
 
-    pub fn gdn_conv(&self, x: &Buf, w: &Buf, state: &Buf, c: usize, t: usize) -> Buf {
+    /// `snap`: rollback buffer for the state after each token but the last (see kernel).
+    pub fn gdn_conv(
+        &self,
+        x: &Buf,
+        w: &Buf,
+        state: &Buf,
+        snap: Option<&Buf>,
+        c: usize,
+        t: usize,
+    ) -> Buf {
         let out = self.alloc(t * c);
         kernels::gdn_conv::launch(
             &self.client,
@@ -310,8 +328,39 @@ impl Gpu {
             w.arg(),
             state.arg(),
             out.arg(),
+            snap.unwrap_or(&self.dummy).arg(),
             c as u32,
             t as u32,
+            snap.is_some(),
+        );
+        out
+    }
+
+    /// dst[0..n] = src[src_off..src_off + n]
+    pub fn copy_f32(&self, dst: &Buf, src: &Buf, src_off: usize, n: usize) {
+        kernels::copy_f32::launch(
+            &self.client,
+            grid_1d(n),
+            CubeDim::new_1d(WG),
+            dst.arg(),
+            src.arg(),
+            src_off as u32,
+            n as u32,
+        );
+    }
+
+    /// Rows [a | b] of width 2d from two [rows, d] buffers.
+    pub fn concat_rows(&self, a: &Buf, b: &Buf, rows: usize, d: usize) -> Buf {
+        let out = self.alloc(rows * 2 * d);
+        kernels::concat_rows::launch(
+            &self.client,
+            grid_1d(rows * 2 * d),
+            CubeDim::new_1d(WG),
+            a.arg(),
+            b.arg(),
+            out.arg(),
+            d as u32,
+            (rows * 2 * d) as u32,
         );
         out
     }
@@ -327,6 +376,7 @@ impl Gpu {
         dt_bias: &Buf,
         norm_w: &Buf,
         state: &Buf,
+        snap: Option<&Buf>,
         t: usize,
         nk: usize,
         nv: usize,
@@ -347,11 +397,13 @@ impl Gpu {
             norm_w.arg(),
             state.arg(),
             out.arg(),
+            snap.unwrap_or(&self.dummy).arg(),
             t as u32,
             nk as u32,
             nv as u32,
             eps,
             dk,
+            snap.is_some(),
         );
         out
     }

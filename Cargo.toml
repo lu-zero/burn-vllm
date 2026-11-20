@@ -10,8 +10,8 @@ wgpu = ["burn-cubecl/wgpu"]
 
 [dependencies]
 burn-cubecl = { version = "0.23.0-pre.2", default-features = false, features = ["std", "autotune", "persistence"] }
-burn-backend = "0.23.0-pre.2"
-burn-std = "0.23.0-pre.2"
+burn-backend = { version = "0.23.0-pre.2", default-features = false }
+burn-std = { version = "0.23.0-pre.2", default-features = false }
 futures-lite = "2"
 memmap2 = "0.9"
 half = "2"

@@ -705,6 +705,15 @@ static MOE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("build moe rayon pool")
 });
+
+/// Run `cpu` on the MoE pool while `main` runs on the calling thread; returns once both
+/// finish. Lets the host keep enqueueing GPU work while missed experts are computed.
+pub fn overlap<R>(cpu: impl FnOnce() + Send, main: impl FnOnce() -> R) -> R {
+    MOE_POOL.in_place_scope(|s| {
+        s.spawn(|_| cpu());
+        main()
+    })
+}
 /// One missed expert for single-token decode (`t == 1`), zero heap allocations.
 #[derive(Clone, Copy)]
 pub struct CpuDecodeJob<'a> {
@@ -861,51 +870,63 @@ pub fn run_experts_cpu(
     let up_row_bytes = up_ty.row_bytes(hidden);
     let down_row_bytes = down_ty.row_bytes(inter);
 
-    // General multi-token path (prefill): pre-quantize each token's activation once,
-    // parallelize over jobs, reading each expert's weights once for all tokens routed to it.
+    // General multi-token path (prefill chunks, speculative verify windows): quantize each
+    // token's activation once, then split the work by (expert, row) so every thread streams
+    // an expert row once for all tokens routed to it.
     let qxs: Vec<QuantX> = (0..t)
         .map(|tok| QuantX::from_f32(&x[tok * hidden..(tok + 1) * hidden]))
         .collect();
-    let partials: Vec<Vec<(usize, Vec<f32>)>> = jobs
-        .par_iter()
-        .map(|job| {
-            let cnt = job.pairs.len();
-            let mut acts = vec![0.0f32; cnt * inter];
-            for r in 0..inter {
+    let mut off = Vec::with_capacity(jobs.len() + 1);
+    off.push(0usize);
+    for j in jobs {
+        off.push(off.last().unwrap() + j.pairs.len() * inter);
+    }
+    let mut acts = vec![0.0f32; *off.last().unwrap()];
+    let acts_ptr = acts.as_mut_ptr() as usize;
+    MOE_POOL.install(|| {
+        // Pass 1: gate + up + silu for every (expert, row, pair).
+        (0..jobs.len() * inter)
+            .into_par_iter()
+            .with_min_len(16)
+            .for_each(|idx| {
+                let (ji, r) = (idx / inter, idx % inter);
+                let job = &jobs[ji];
                 let g_row = &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes];
                 let u_row = &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes];
+                let dst = acts_ptr as *mut f32;
                 for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
                     let xt = &x[tok * hidden..(tok + 1) * hidden];
                     let g = dot_q8(gate_ty, g_row, &qxs[tok], xt);
                     let u = dot_q8(up_ty, u_row, &qxs[tok], xt);
-                    acts[pi * inter + r] = silu(g) * u;
+                    // SAFETY: each (job, pair, row) slot is written by exactly one task.
+                    unsafe { *dst.add(off[ji] + pi * inter + r) = silu(g) * u };
                 }
-            }
-            let qacts: Vec<QuantX> = (0..cnt)
-                .map(|pi| QuantX::from_f32(&acts[pi * inter..(pi + 1) * inter]))
-                .collect();
-            let mut ys: Vec<(usize, Vec<f32>)> = job
-                .pairs
-                .iter()
-                .map(|&(tok, _)| (tok, vec![0.0f32; hidden]))
-                .collect();
-            for d in 0..hidden {
+            });
+        let qacts: Vec<Vec<QuantX>> = jobs
+            .iter()
+            .enumerate()
+            .map(|(ji, job)| {
+                (0..job.pairs.len())
+                    .map(|pi| {
+                        let s = off[ji] + pi * inter;
+                        QuantX::from_f32(&acts[s..s + inter])
+                    })
+                    .collect()
+            })
+            .collect();
+        // Pass 2: down projection, accumulated per output column so tasks never share one.
+        let out_ptr = out.as_mut_ptr() as usize;
+        (0..hidden).into_par_iter().with_min_len(16).for_each(|d| {
+            let dst = out_ptr as *mut f32;
+            for (ji, job) in jobs.iter().enumerate() {
                 let d_row = &job.down_raw[d * down_row_bytes..(d + 1) * down_row_bytes];
-                for (pi, &(_, wt)) in job.pairs.iter().enumerate() {
-                    let act = &acts[pi * inter..(pi + 1) * inter];
-                    ys[pi].1[d] = wt * dot_q8(down_ty, d_row, &qacts[pi], act);
+                for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
+                    let s = off[ji] + pi * inter;
+                    let y = wt * dot_q8(down_ty, d_row, &qacts[ji][pi], &acts[s..s + inter]);
+                    // SAFETY: column `d` of every token row belongs to this task alone.
+                    unsafe { *dst.add(tok * hidden + d) += y };
                 }
             }
-            ys
-        })
-        .collect();
-
-    for group in partials {
-        for (tok, y) in group {
-            let dst = &mut out[tok * hidden..(tok + 1) * hidden];
-            for (o, &v) in dst.iter_mut().zip(y.iter()) {
-                *o += v;
-            }
-        }
-    }
+        });
+    });
 }

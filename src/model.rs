@@ -7,7 +7,7 @@ pub struct Prof {
     acc: [f64; PROF_N],
 }
 
-const PROF_N: usize = 8;
+const PROF_N: usize = 10;
 const PROF_NAMES: [&str; PROF_N] = [
     "gdn",
     "attn",
@@ -17,6 +17,8 @@ const PROF_NAMES: [&str; PROF_N] = [
     "upload",
     "cpu",
     "head",
+    "draft",
+    "catchup",
 ];
 
 impl Prof {
@@ -83,6 +85,8 @@ pub struct Config {
     pub full_attn_interval: usize,
     /// FFN width of dense (non-MoE) models; 0 for MoE.
     pub dense_inter: usize,
+    /// Trailing multi-token-prediction (NextN) blocks, excluded from `n_layers`.
+    pub n_mtp: usize,
 }
 
 impl Config {
@@ -96,7 +100,7 @@ impl Config {
         let k = |s: &str| g.meta_u64(&format!("{arch}.{s}")).map(|v| v as usize);
         let vocab = g.tensor("token_embd.weight")?.dims[1] as usize;
         let c = Self {
-            n_layers: k("block_count")?,
+            n_layers: k("block_count")? - k("nextn_predict_layers").unwrap_or(0),
             hidden: k("embedding_length")?,
             vocab,
             n_heads: k("attention.head_count")?,
@@ -123,6 +127,7 @@ impl Config {
             ssm_nv: k("ssm.time_step_rank")?,
             full_attn_interval: k("full_attention_interval")?,
             dense_inter: if moe { 0 } else { k("feed_forward_length")? },
+            n_mtp: k("nextn_predict_layers").unwrap_or(0),
         };
         ensure!(c.topk <= MOE_MAXM, "topk {} > {MOE_MAXM}", c.topk);
         ensure!(c.conv_k == 4, "conv kernel {} unsupported", c.conv_k);
@@ -305,6 +310,15 @@ impl ExpertStore {
     }
 }
 
+/// Weights of the MTP (NextN) draft head beyond its decoder block (stored as the last
+/// entry of `layers` / `moes`): the [embedding | hidden] projection and the norms.
+pub struct MtpW {
+    eh_proj: QWeight,
+    enorm: Buf,
+    hnorm: Buf,
+    head_norm: Buf,
+}
+
 struct MoeW {
     /// Router [n_experts + 1, hidden] in f32; the last row is the shared-expert gate.
     router: QWeight,
@@ -335,6 +349,7 @@ pub struct Model {
     moes: Vec<MoeW>,
     /// Per-layer dense FFN weights (empty for MoE models).
     denses: Vec<DenseW>,
+    mtp: Option<MtpW>,
     out_norm: Buf,
     lm_head: QWeight,
     embd: TensorInfo,
@@ -343,6 +358,36 @@ pub struct Model {
     clock: u64,
     pub stats: Stats,
     pub prof: Prof,
+}
+/// Where a micro-batch writes its GDN rollback snapshots: token offset in the window, and
+/// whether its last token's state is needed (another micro-batch follows).
+#[derive(Clone, Copy)]
+struct Snap {
+    off: usize,
+    save_last: bool,
+}
+
+/// Router output for one batch, before the host readback.
+struct Routed {
+    logits: Buf,
+    wts: Buf,
+    pack: Buf,
+}
+
+/// A multi-token MoE step between its routing sync and its combine: shared + hit experts
+/// are enqueued on the GPU, `misses` still need the CPU.
+struct MoeJob {
+    li: usize,
+    t: usize,
+    logits: Buf,
+    wts: Buf,
+    sh: Buf,
+    y: Buf,
+    /// Missed experts with their (token row, routing weight) pairs.
+    misses: Vec<(usize, Vec<(usize, f32)>)>,
+    h2_host: Vec<f32>,
+    /// [hit weights (t*topk) | CPU expert sum (t*hidden)], uploaded for the combine.
+    pack: Vec<f32>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -393,7 +438,29 @@ pub struct LoadOptions {
     /// VRAM budget in bytes for weights + cache (None = device-reported total).
     pub vram_budget: Option<u64>,
     pub max_ctx: usize,
+    /// Draft tokens per speculative step (0 = no speculative decoding); sizes the
+    /// rollback snapshots reserved in VRAM.
+    pub spec_k: usize,
 }
+
+#[derive(Default, Clone, Copy)]
+pub struct FwdOpts {
+    /// Logits for every input row (default: the last row only).
+    pub all_rows: bool,
+    /// Return the out-normed hidden state of every row.
+    pub keep_hidden: bool,
+    /// Save per-token GDN snapshots so a verify window can be rolled back.
+    pub snap: bool,
+}
+
+pub struct FwdOut {
+    /// `rows * vocab` logits.
+    pub logits: Vec<f32>,
+    /// `[t, hidden]` out-normed hidden states, when requested.
+    pub hidden: Option<Buf>,
+}
+
+mod mtp;
 
 pub struct State {
     pub pos: usize,
@@ -401,6 +468,12 @@ pub struct State {
     kv: Vec<Option<(Buf, Buf)>>,
     conv: Vec<Option<Buf>>,
     ssm: Vec<Option<Buf>>,
+    /// MTP block's own KV cache.
+    mtp_kv: Option<(Buf, Buf)>,
+    /// Per-GDN-layer snapshots of the recurrent / conv state after each token of a
+    /// verify window but the last ([spec_k, ...]), for rollback on rejection.
+    ssm_snap: Vec<Option<Buf>>,
+    conv_snap: Vec<Option<Buf>>,
 }
 
 fn upload_weight(gpu: &Gpu, g: &Gguf, name: &str) -> Result<QWeight> {
@@ -437,9 +510,14 @@ impl Model {
         // Size the expert pools before allocating anything.
         let mut expert_bytes_layer = 0usize;
         let mut dense_bytes = 0usize;
+        let mtp_prefix = format!("blk.{}.", cfg.n_layers);
         for t in g.tensors.values() {
+            let is_mtp = cfg.n_mtp > 0 && t.name.starts_with(&mtp_prefix);
             if t.name.contains("_exps.") {
-                expert_bytes_layer = expert_bytes_layer.max(0) + t.nbytes;
+                // The MTP block's experts stay in RAM (CPU-computed), never on the card.
+                if !is_mtp {
+                    expert_bytes_layer += t.nbytes;
+                }
             } else if t.name != "token_embd.weight" {
                 dense_bytes += t.nbytes;
             }
@@ -449,14 +527,24 @@ impl Model {
         } else {
             0
         };
-        let kv_bytes =
-            cfg.n_layers / cfg.full_attn_interval * 2 * opts.max_ctx * cfg.n_kv * cfg.head_dim * 4;
+        let kv_bytes = (cfg.n_layers / cfg.full_attn_interval + cfg.n_mtp)
+            * 2
+            * opts.max_ctx
+            * cfg.n_kv
+            * cfg.head_dim
+            * 4;
         let total_vram = opts
             .vram_budget
             .or(gpu.client.properties().memory.max_memory())
             .unwrap_or(8 << 30) as usize;
         // GPU layouts carry a little padding; scratch for a 512-token prefill chunk.
-        let reserve = (dense_bytes as f64 * 1.08) as usize + kv_bytes + (640 << 20);
+        // Speculative decoding keeps per-token GDN state snapshots for rollback.
+        let gdn_layers = cfg.n_layers - cfg.n_layers / cfg.full_attn_interval;
+        let snap_bytes = opts.spec_k
+            * gdn_layers
+            * (cfg.ssm_nv * cfg.ssm_dk * cfg.ssm_dk + (cfg.conv_k - 1) * cfg.conv_dim())
+            * 4;
+        let reserve = (dense_bytes as f64 * 1.08) as usize + kv_bytes + snap_bytes + (640 << 20);
         let slots = if cfg.n_experts == 0 {
             0
         } else {
@@ -483,10 +571,12 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut moes = Vec::new();
         let mut denses = Vec::new();
+        let mut mtp = None;
         gpu.client
             .memory_persistent_allocation((), |_| -> Result<()> {
-                for i in 0..cfg.n_layers {
-                    let mixer = if cfg.is_full_attn(i) {
+                for i in 0..cfg.n_layers + cfg.n_mtp {
+                    let is_mtp = i >= cfg.n_layers;
+                    let mixer = if cfg.is_full_attn(i) || is_mtp {
                         Mixer::Attn(AttnW {
                             q: upload_weight(gpu_ref, g, &blk(i, "attn_q.weight"))?,
                             k: upload_weight(gpu_ref, g, &blk(i, "attn_k.weight"))?,
@@ -536,14 +626,15 @@ impl Model {
                             "layer {i}: gate/up expert types differ"
                         );
                         let ne = cfg.n_experts;
+                        let sl = if is_mtp { 0 } else { slots };
                         let experts = ExpertStore {
-                            gate: ExpertTensor::new(gpu_ref, gate_t, ne, slots),
-                            up: ExpertTensor::new(gpu_ref, up_t, ne, slots),
-                            down: ExpertTensor::new(gpu_ref, down_t, ne, slots),
-                            slots,
+                            gate: ExpertTensor::new(gpu_ref, gate_t, ne, sl),
+                            up: ExpertTensor::new(gpu_ref, up_t, ne, sl),
+                            down: ExpertTensor::new(gpu_ref, down_t, ne, sl),
+                            slots: sl,
                             slot_of: vec![-1; ne],
-                            expert_in: vec![-1; slots],
-                            stamp: vec![0; slots],
+                            expert_in: vec![-1; sl],
+                            stamp: vec![0; sl],
                             freq: vec![0; ne],
                         };
                         moes.push(MoeW {
@@ -559,6 +650,18 @@ impl Model {
                         post_norm: upload_f32(gpu_ref, g, &blk(i, "post_attention_norm.weight"))?,
                         mixer,
                     });
+                    if is_mtp {
+                        mtp = Some(MtpW {
+                            eh_proj: upload_weight(gpu_ref, g, &blk(i, "nextn.eh_proj.weight"))?,
+                            enorm: upload_f32(gpu_ref, g, &blk(i, "nextn.enorm.weight"))?,
+                            hnorm: upload_f32(gpu_ref, g, &blk(i, "nextn.hnorm.weight"))?,
+                            head_norm: upload_f32(
+                                gpu_ref,
+                                g,
+                                &blk(i, "nextn.shared_head_norm.weight"),
+                            )?,
+                        });
+                    }
                 }
                 Ok(())
             })?;
@@ -578,6 +681,7 @@ impl Model {
             layers,
             moes,
             denses,
+            mtp,
             out_norm,
             lm_head,
             embd,
@@ -595,14 +699,18 @@ impl Model {
             let all: Vec<(usize, usize)> = (0..store.slots).map(|s| (s, s)).collect();
             store.load_many(&model.gpu, &model.gguf, &all);
             model.gpu.sync();
-            eprint!("\rloading experts: layer {}/{}", li + 1, model.cfg.n_layers);
+            eprint!(
+                "\rloading experts: layer {}/{}",
+                (li + 1).min(model.cfg.n_layers),
+                model.cfg.n_layers
+            );
         }
         eprintln!();
         eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
         Ok(model)
     }
 
-    pub fn new_state(&self, max_ctx: usize) -> State {
+    pub fn new_state(&self, max_ctx: usize, spec_k: usize) -> State {
         let c = &self.cfg;
         let mut st = State {
             pos: 0,
@@ -610,6 +718,9 @@ impl Model {
             kv: vec![],
             conv: vec![],
             ssm: vec![],
+            mtp_kv: None,
+            ssm_snap: vec![],
+            conv_snap: vec![],
         };
         for i in 0..c.n_layers {
             if c.is_full_attn(i) {
@@ -617,13 +728,29 @@ impl Model {
                 st.kv.push(Some((self.gpu.zeros(n), self.gpu.zeros(n))));
                 st.conv.push(None);
                 st.ssm.push(None);
+                st.conv_snap.push(None);
+                st.ssm_snap.push(None);
             } else {
                 st.kv.push(None);
                 st.conv
                     .push(Some(self.gpu.zeros((c.conv_k - 1) * c.conv_dim())));
                 st.ssm
                     .push(Some(self.gpu.zeros(c.ssm_nv * c.ssm_dk * c.ssm_dk)));
+                if spec_k > 0 {
+                    st.conv_snap
+                        .push(Some(self.gpu.alloc(spec_k * (c.conv_k - 1) * c.conv_dim())));
+                    st.ssm_snap.push(Some(
+                        self.gpu.alloc(spec_k * c.ssm_nv * c.ssm_dk * c.ssm_dk),
+                    ));
+                } else {
+                    st.conv_snap.push(None);
+                    st.ssm_snap.push(None);
+                }
             }
+        }
+        if self.mtp.is_some() {
+            let n = max_ctx * c.n_kv * c.head_dim;
+            st.mtp_kv = Some((self.gpu.zeros(n), self.gpu.zeros(n)));
         }
         st
     }
@@ -642,6 +769,12 @@ impl Model {
 
     /// Run `tokens` through the model, appending to `state`; returns last-token logits.
     pub fn forward(&mut self, tokens: &[u32], st: &mut State) -> Result<Vec<f32>> {
+        Ok(self.forward_ext(tokens, st, FwdOpts::default())?.logits)
+    }
+
+    /// [`Self::forward`] with optional all-row logits, the normed hidden states of every
+    /// row (the MTP head's input) and GDN rollback snapshots.
+    pub fn forward_ext(&mut self, tokens: &[u32], st: &mut State, opts: FwdOpts) -> Result<FwdOut> {
         let t = tokens.len();
         ensure!(t > 0, "empty input");
         if st.pos + t > st.max_ctx {
@@ -650,100 +783,64 @@ impl Model {
         let c = self.cfg.clone();
         let gm = self.gemm_min_m;
         let x = self.gpu.upload_f32(&self.embed(tokens));
+        let pipelined =
+            c.n_experts > 0 && (2..=64).contains(&t) && std::env::var_os("BURN_NO_PIPE").is_none();
         let mut pending_promo: Option<(usize, usize, usize)> = None;
-        for li in 0..c.n_layers {
-            let h = self
-                .gpu
-                .rmsnorm(&x, &self.layers[li].attn_norm, t, c.hidden, c.eps);
-            let gpu = &self.gpu;
-            match &self.layers[li].mixer {
-                Mixer::Gdn(w) => {
-                    let qkv = gpu.linear(&w.qkv, &h, t, gm);
-                    let z = gpu.linear(&w.z, &h, t, gm);
-                    let a = gpu.linear(&w.alpha, &h, t, gm);
-                    let b = gpu.linear(&w.beta, &h, t, gm);
-                    let conv = gpu.gdn_conv(
-                        &qkv,
-                        &w.conv_w,
-                        st.conv[li].as_ref().unwrap(),
-                        c.conv_dim(),
-                        t,
-                    );
-                    let o = gpu.gdn_recurrent(
-                        &conv,
-                        &a,
-                        &b,
-                        &z,
-                        &w.ssm_a,
-                        &w.dt_bias,
-                        &w.norm,
-                        st.ssm[li].as_ref().unwrap(),
-                        t,
-                        c.ssm_nk,
-                        c.ssm_nv,
-                        c.ssm_dk,
-                        c.eps,
-                    );
-                    gpu.linear_acc(&w.out, &o, t, &x, gm);
-                }
-                Mixer::Attn(w) => {
-                    let (kc, vc) = st.kv[li].as_ref().unwrap();
-                    let qg = gpu.linear(&w.q, &h, t, gm);
-                    let k = gpu.linear(&w.k, &h, t, gm);
-                    let v = gpu.linear(&w.v, &h, t, gm);
-                    let q = gpu.attn_prep(
-                        &qg,
-                        &k,
-                        &v,
-                        &w.q_norm,
-                        &w.k_norm,
-                        kc,
-                        vc,
-                        t,
-                        c.n_heads,
-                        c.n_kv,
-                        c.head_dim,
-                        st.pos,
-                        c.rope_dim,
-                        c.rope_theta,
-                        c.eps,
-                    );
-                    let o =
-                        gpu.attention(&q, &qg, kc, vc, t, c.n_heads, c.n_kv, c.head_dim, st.pos);
-                    gpu.linear_acc(&w.o, &o, t, &x, gm);
-                }
-            }
-            self.prof.tick(
-                &self.gpu,
-                if matches!(self.layers[li].mixer, Mixer::Gdn(_)) {
-                    0
+        if pipelined {
+            self.layers_pipelined(&x, t, st, opts.snap, &mut pending_promo);
+        } else {
+            let snap = opts.snap.then_some(Snap {
+                off: 0,
+                save_last: false,
+            });
+            for li in 0..c.n_layers {
+                self.mix(li, &x, t, st.pos, st, snap);
+                self.prof.tick(
+                    &self.gpu,
+                    if matches!(self.layers[li].mixer, Mixer::Gdn(_)) {
+                        0
+                    } else {
+                        1
+                    },
+                );
+                let h2 = self
+                    .gpu
+                    .rmsnorm(&x, &self.layers[li].post_norm, t, c.hidden, c.eps);
+                if self.cfg.n_experts == 0 {
+                    let d = &self.denses[li];
+                    let g = self.gpu.linear(&d.gate, &h2, t, gm);
+                    let u = self.gpu.linear(&d.up, &h2, t, gm);
+                    let a = self.gpu.swiglu(&g, &u, t * c.dense_inter);
+                    self.gpu.linear_acc(&d.down, &a, t, &x, gm);
                 } else {
-                    1
-                },
-            );
-            let h2 = self
-                .gpu
-                .rmsnorm(&x, &self.layers[li].post_norm, t, c.hidden, c.eps);
-            if self.cfg.n_experts == 0 {
-                let d = &self.denses[li];
-                let gm = self.gemm_min_m;
-                let g = self.gpu.linear(&d.gate, &h2, t, gm);
-                let u = self.gpu.linear(&d.up, &h2, t, gm);
-                let a = self.gpu.swiglu(&g, &u, t * c.dense_inter);
-                self.gpu.linear_acc(&d.down, &a, t, &x, gm);
-            } else {
-                self.moe(li, &h2, &x, t, &mut pending_promo)?;
+                    self.moe(li, &h2, &x, t, &mut pending_promo)?;
+                }
+                self.prof.tick(&self.gpu, 2);
             }
-            self.prof.tick(&self.gpu, 2);
         }
         st.pos += t;
-        let last = Buf {
-            h: x.h.clone().offset_start(((t - 1) * c.hidden * 4) as u64),
-            len: c.hidden,
+        let hidden = c.hidden;
+        let xn_all = (opts.all_rows || opts.keep_hidden)
+            .then(|| self.gpu.rmsnorm(&x, &self.out_norm, t, hidden, c.eps));
+        let (xn, rows) = match (&xn_all, opts.all_rows) {
+            (Some(a), true) => (a.clone(), t),
+            (Some(a), false) => (
+                Buf {
+                    h: a.h.clone().offset_start(((t - 1) * hidden * 4) as u64),
+                    len: hidden,
+                },
+                1,
+            ),
+            (None, _) => {
+                let last = Buf {
+                    h: x.h.clone().offset_start(((t - 1) * hidden * 4) as u64),
+                    len: hidden,
+                };
+                (self.gpu.rmsnorm(&last, &self.out_norm, 1, hidden, c.eps), 1)
+            }
         };
-        let xn = self.gpu.rmsnorm(&last, &self.out_norm, 1, c.hidden, c.eps);
-        let logits = self.gpu.alloc(c.vocab);
-        self.gpu.qmatmul(&self.lm_head, &xn, 1, &logits, false);
+        let logits = self.gpu.alloc(rows * c.vocab);
+        self.gpu.qmatmul(&self.lm_head, &xn, rows, &logits, false);
         // Overlap any final-layer promotion repack with the ~2 ms lm_head matmul.
         if let Some((prev_li, prev_e, prev_slot)) = pending_promo.take() {
             let tl = Instant::now();
@@ -756,7 +853,396 @@ impl Model {
             self.stats.promotions += 1;
         }
         self.prof.tick(&self.gpu, 7);
-        Ok(self.gpu.read_f32(&logits))
+        Ok(FwdOut {
+            logits: self.gpu.read_f32(&logits),
+            hidden: xn_all,
+        })
+    }
+
+    /// Enqueue layer `li`'s token mixer for the `t` rows of `x` (absolute position `pos`),
+    /// accumulating into `x`.
+    fn mix(&self, li: usize, x: &Buf, t: usize, pos: usize, st: &State, snap: Option<Snap>) {
+        let c = &self.cfg;
+        let gm = self.gemm_min_m;
+        let gpu = &self.gpu;
+        let h = gpu.rmsnorm(x, &self.layers[li].attn_norm, t, c.hidden, c.eps);
+        match &self.layers[li].mixer {
+            Mixer::Gdn(w) => {
+                let ssm_sz = c.ssm_nv * c.ssm_dk * c.ssm_dk;
+                let conv_sz = (c.conv_k - 1) * c.conv_dim();
+                // Snapshot views starting at this micro-batch's first token.
+                let view = |b: &Option<Buf>, sz: usize, s: Snap| {
+                    b.as_ref().map(|b| Buf {
+                        h: b.h.clone().offset_start((s.off * sz * 4) as u64),
+                        len: b.len - s.off * sz,
+                    })
+                };
+                let snaps = snap.map(|s| {
+                    (
+                        view(&st.conv_snap[li], conv_sz, s),
+                        view(&st.ssm_snap[li], ssm_sz, s),
+                    )
+                });
+                let (conv_snap, ssm_snap) = snaps.clone().unwrap_or((None, None));
+                let state_conv = st.conv[li].as_ref().unwrap();
+                let state_ssm = st.ssm[li].as_ref().unwrap();
+                let qkv = gpu.linear(&w.qkv, &h, t, gm);
+                let z = gpu.linear(&w.z, &h, t, gm);
+                let a = gpu.linear(&w.alpha, &h, t, gm);
+                let b = gpu.linear(&w.beta, &h, t, gm);
+                let conv = gpu.gdn_conv(
+                    &qkv,
+                    &w.conv_w,
+                    state_conv,
+                    conv_snap.as_ref().filter(|_| t > 1),
+                    c.conv_dim(),
+                    t,
+                );
+                let o = gpu.gdn_recurrent(
+                    &conv,
+                    &a,
+                    &b,
+                    &z,
+                    &w.ssm_a,
+                    &w.dt_bias,
+                    &w.norm,
+                    state_ssm,
+                    ssm_snap.as_ref().filter(|_| t > 1),
+                    t,
+                    c.ssm_nk,
+                    c.ssm_nv,
+                    c.ssm_dk,
+                    c.eps,
+                );
+                // The kernels skip the last token's state; a micro-batch followed by
+                // another in the same window must save it too.
+                if let (Some(s), Some(cs), Some(ss)) = (snap, conv_snap, ssm_snap)
+                    && s.save_last
+                {
+                    let last = |b: &Buf, sz: usize| Buf {
+                        h: b.h.clone().offset_start(((t - 1) * sz * 4) as u64),
+                        len: sz,
+                    };
+                    gpu.copy_f32(&last(&cs, conv_sz), state_conv, 0, conv_sz);
+                    gpu.copy_f32(&last(&ss, ssm_sz), state_ssm, 0, ssm_sz);
+                }
+                gpu.linear_acc(&w.out, &o, t, x, gm);
+            }
+            Mixer::Attn(w) => {
+                let (kc, vc) = st.kv[li].as_ref().unwrap();
+                let qg = gpu.linear(&w.q, &h, t, gm);
+                let k = gpu.linear(&w.k, &h, t, gm);
+                let v = gpu.linear(&w.v, &h, t, gm);
+                let q = gpu.attn_prep(
+                    &qg,
+                    &k,
+                    &v,
+                    &w.q_norm,
+                    &w.k_norm,
+                    kc,
+                    vc,
+                    t,
+                    c.n_heads,
+                    c.n_kv,
+                    c.head_dim,
+                    pos,
+                    c.rope_dim,
+                    c.rope_theta,
+                    c.eps,
+                );
+                let o = gpu.attention(&q, &qg, kc, vc, t, c.n_heads, c.n_kv, c.head_dim, pos);
+                gpu.linear_acc(&w.o, &o, t, x, gm);
+            }
+        }
+    }
+
+    /// Mixer + post-norm + router for one micro-batch; returns (h2, routing).
+    fn mix_route(
+        &self,
+        li: usize,
+        x: &Buf,
+        t: usize,
+        pos: usize,
+        st: &State,
+        snap: Option<Snap>,
+    ) -> (Buf, Routed) {
+        let c = &self.cfg;
+        self.mix(li, x, t, pos, st, snap);
+        let h2 = self
+            .gpu
+            .rmsnorm(x, &self.layers[li].post_norm, t, c.hidden, c.eps);
+        let r = self.moe_route_enqueue(li, &h2, t);
+        (h2, r)
+    }
+
+    /// Two micro-batches in flight so one batch's CPU experts overlap the other batch's
+    /// GPU mixer: per layer, A's CPU experts run while B's mixer is enqueued, and B's
+    /// CPU experts run while A's next-layer mixer is enqueued. B only depends on A
+    /// through the per-layer GDN state / KV cache, which the stream order preserves.
+    fn layers_pipelined(
+        &mut self,
+        x: &Buf,
+        t: usize,
+        st: &State,
+        snap: bool,
+        pending: &mut Option<(usize, usize, usize)>,
+    ) {
+        let n_layers = self.cfg.n_layers;
+        let hd = self.cfg.hidden;
+        let ta = t / 2;
+        let mb = [(0usize, ta), (ta, t - ta)];
+        let xs = mb.map(|(r0, n)| Buf {
+            h: x.h.clone().offset_start((r0 * hd * 4) as u64),
+            len: n * hd,
+        });
+        let snaps = [
+            snap.then_some(Snap {
+                off: 0,
+                save_last: true,
+            }),
+            snap.then_some(Snap {
+                off: ta,
+                save_last: false,
+            }),
+        ];
+        let pos = st.pos;
+        let mut routed = [Some(self.mix_route(0, &xs[0], ta, pos, st, snaps[0])), None];
+        for li in 0..n_layers {
+            for m in 0..2 {
+                let (h2, r) = routed[m].take().expect("micro-batch routed");
+                let mut job = self.moe_begin(li, &h2, mb[m].1, r, pending);
+                let (nli, nm) = if m == 0 { (li, 1) } else { (li + 1, 0) };
+                let this = &*self;
+                let tc = Instant::now();
+                routed[nm] = cpu_moe::overlap(
+                    || this.moe_cpu(&mut job),
+                    || {
+                        (nli < n_layers).then(|| {
+                            this.mix_route(nli, &xs[nm], mb[nm].1, pos + mb[nm].0, st, snaps[nm])
+                        })
+                    },
+                );
+                self.stats.cpu_secs += tc.elapsed().as_secs_f64();
+                self.moe_finish(&xs[m], job);
+            }
+        }
+    }
+
+    /// LFU promotion candidate: hottest missed expert replacing the coldest slot, if worthwhile.
+    fn pick_promo(&self, li: usize, misses: &[usize]) -> Option<(usize, usize, usize)> {
+        let st = &self.moes[li].experts;
+        if st.slots == 0 {
+            return None;
+        }
+        let &best_e = misses.iter().max_by_key(|&&e| st.freq[e])?;
+        let best_f = st.freq[best_e];
+        let victim = (0..st.slots)
+            .min_by_key(|&s| {
+                let cur = st.expert_in[s];
+                let f = if cur >= 0 { st.freq[cur as usize] } else { 0 };
+                (f, st.stamp[s])
+            })
+            .unwrap();
+        let cur = st.expert_in[victim];
+        let cur_f = if cur >= 0 { st.freq[cur as usize] } else { 0 };
+        ((cur_f == 0 && best_f >= 2) || (best_f >= cur_f + 6)).then_some((li, best_e, victim))
+    }
+
+    /// Enqueue the router and the packed (ids, weights, h2) readback buffer.
+    fn moe_route_enqueue(&self, li: usize, h2: &Buf, t: usize) -> Routed {
+        let c = &self.cfg;
+        let (ne, topk) = (c.n_experts, c.topk);
+        let logits = self
+            .gpu
+            .linear(&self.moes[li].router, h2, t, self.gemm_min_m);
+        let (_ids, wts, pack) = self
+            .gpu
+            .moe_route_pack(&logits, h2, t, ne, ne + 1, c.hidden, topk);
+        Routed { logits, wts, pack }
+    }
+
+    /// Read the routing back (the per-layer sync), overlapping the repack of any pending
+    /// promotion with the GPU work still in flight, then commit it.
+    fn moe_sync(
+        &mut self,
+        r: &Routed,
+        pending_promo: &mut Option<(usize, usize, usize)>,
+    ) -> Vec<u32> {
+        let ready_promo = pending_promo.take().map(|(prev_li, prev_e, prev_slot)| {
+            let tl = Instant::now();
+            let packed = self.moes[prev_li].experts.repack_one(&self.gguf, prev_e);
+            self.stats.upload_secs += tl.elapsed().as_secs_f64();
+            (prev_li, prev_e, prev_slot, packed)
+        });
+        let ts = Instant::now();
+        let pack_host = self.gpu.read_u32(&r.pack);
+        self.stats.route_sync_secs += ts.elapsed().as_secs_f64();
+        if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo {
+            let tl = Instant::now();
+            self.moes[prev_li]
+                .experts
+                .commit_one(&self.gpu, prev_e, prev_slot, packed);
+            self.moes[prev_li].experts.stamp[prev_slot] = self.clock;
+            self.stats.upload_secs += tl.elapsed().as_secs_f64();
+            self.stats.promotions += 1;
+        }
+        pack_host
+    }
+
+    /// [`Self::moe_sync`] + [`Self::moe_begin_host`].
+    fn moe_begin(
+        &mut self,
+        li: usize,
+        h2: &Buf,
+        t: usize,
+        r: Routed,
+        pending_promo: &mut Option<(usize, usize, usize)>,
+    ) -> MoeJob {
+        let pack_host = self.moe_sync(&r, pending_promo);
+        self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo)
+    }
+
+    /// Multi-token hybrid MoE, first half: partition routed pairs into VRAM hits and
+    /// misses, enqueue the shared expert + hit experts on the GPU, and pick a promotion.
+    /// The misses are left for [`Self::moe_cpu`].
+    fn moe_begin_host(
+        &mut self,
+        li: usize,
+        h2: &Buf,
+        t: usize,
+        pack_host: &[u32],
+        r: Routed,
+        pending_promo: &mut Option<(usize, usize, usize)>,
+    ) -> MoeJob {
+        let c = &self.cfg;
+        let (ne, topk, inter, hidden) = (c.n_experts, c.topk, c.expert_inter, c.hidden);
+        let gm = self.gemm_min_m;
+        let npairs = t * topk;
+        let ids_host = &pack_host[..npairs];
+        let wts_host: &[f32] = bytemuck::cast_slice(&pack_host[npairs..2 * npairs]);
+        let h2_host: &[f32] = bytemuck::cast_slice(&pack_host[2 * npairs..2 * npairs + t * hidden]);
+
+        let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); ne];
+        for (p, &e) in ids_host.iter().enumerate() {
+            by_expert[e as usize].push(p as u32);
+        }
+        let mut hit_desc = Vec::new();
+        let mut max_cnt = 0usize;
+        // Hit weights first; CPU-computed pairs get weight 0 (their sum arrives premixed).
+        let mut pack = vec![0.0f32; npairs + t * hidden];
+        pack[..npairs].copy_from_slice(wts_host);
+        let mut misses = Vec::new();
+        {
+            let st = &mut self.moes[li].experts;
+            for (e, pairs) in by_expert.iter().enumerate() {
+                if pairs.is_empty() {
+                    continue;
+                }
+                self.clock += 1;
+                st.freq[e] = st.freq[e].saturating_add(pairs.len() as u32);
+                if st.slot_of[e] >= 0 {
+                    let slot = st.slot_of[e] as usize;
+                    st.stamp[slot] = self.clock;
+                    self.stats.expert_hits += pairs.len() as u64;
+                    for chunk in pairs.chunks(MOE_MAXM) {
+                        max_cnt = max_cnt.max(chunk.len());
+                        hit_desc.push(slot as u32);
+                        hit_desc.push(chunk.len() as u32);
+                        hit_desc.extend((0..MOE_MAXM).map(|i| chunk.get(i).copied().unwrap_or(0)));
+                    }
+                } else {
+                    self.stats.expert_misses += pairs.len() as u64;
+                    let rows = pairs
+                        .iter()
+                        .map(|&p| {
+                            pack[p as usize] = 0.0;
+                            ((p as usize) / topk, wts_host[p as usize])
+                        })
+                        .collect();
+                    misses.push((e, rows));
+                }
+            }
+        }
+
+        let w = &self.moes[li];
+        let g = self.gpu.linear(&w.gate_sh, h2, t, gm);
+        let u = self.gpu.linear(&w.up_sh, h2, t, gm);
+        let a = self.gpu.swiglu(&g, &u, t * c.shared_inter);
+        let sh = self.gpu.linear(&w.down_sh, &a, t, gm);
+        let y = self.gpu.alloc(npairs * hidden);
+        if !hit_desc.is_empty() {
+            let act = self.gpu.alloc(npairs * inter);
+            let ntiles = hit_desc.len() / MOE_DESC;
+            let desc_buf = self.gpu.upload_u32(&hit_desc);
+            self.run_experts(li, &desc_buf, ntiles, max_cnt, h2, &act, &y);
+        }
+        if t <= 8 && !misses.is_empty() {
+            let ids: Vec<usize> = misses.iter().map(|m| m.0).collect();
+            *pending_promo = self.pick_promo(li, &ids);
+        }
+        MoeJob {
+            li,
+            t,
+            logits: r.logits,
+            wts: r.wts,
+            sh,
+            y,
+            misses,
+            h2_host: h2_host.to_vec(),
+            pack,
+        }
+    }
+
+    /// Multi-token hybrid MoE, CPU half: compute the missed experts into `job.pack`.
+    /// Touches no GPU or mutable model state, so it can run alongside GPU enqueueing.
+    fn moe_cpu(&self, job: &mut MoeJob) {
+        if job.misses.is_empty() {
+            return;
+        }
+        let c = &self.cfg;
+        let st = &self.moes[job.li].experts;
+        let jobs: Vec<CpuExpertJob<'_>> = job
+            .misses
+            .iter()
+            .map(|(e, pairs)| CpuExpertJob {
+                gate_raw: st.gate.raw(&self.gguf, *e),
+                up_raw: st.up.raw(&self.gguf, *e),
+                down_raw: st.down.raw(&self.gguf, *e),
+                pairs: pairs.clone(),
+            })
+            .collect();
+        let npairs = job.t * c.topk;
+        cpu_moe::run_experts_cpu(
+            st.gate.info.ty,
+            st.up.info.ty,
+            st.down.info.ty,
+            &jobs,
+            &job.h2_host,
+            job.t,
+            c.hidden,
+            c.expert_inter,
+            &mut job.pack[npairs..],
+        );
+    }
+
+    /// Multi-token hybrid MoE, last half: upload the CPU results and combine into `x`.
+    fn moe_finish(&self, x: &Buf, job: MoeJob) {
+        let c = &self.cfg;
+        let (ne, topk) = (c.n_experts, c.topk);
+        let cpu = (!job.misses.is_empty()).then(|| self.gpu.upload_f32(&job.pack));
+        self.gpu.moe_combine(
+            x,
+            &job.y,
+            &job.wts,
+            &job.sh,
+            &job.logits,
+            cpu.as_ref(),
+            job.t,
+            c.hidden,
+            topk,
+            ne + 1,
+            ne,
+        );
     }
 
     fn moe(
@@ -767,7 +1253,7 @@ impl Model {
         t: usize,
         pending_promo: &mut Option<(usize, usize, usize)>,
     ) -> Result<()> {
-        let c = &self.cfg;
+        let c = &self.cfg.clone();
         let (ne, topk, inter, hidden) = (c.n_experts, c.topk, c.expert_inter, c.hidden);
         let gm = self.gemm_min_m;
         let npairs = t * topk;
@@ -795,29 +1281,17 @@ impl Model {
             // Hybrid GPU + CPU path:
             // 1. Route and pack (ids, wts, h2) in a single device-to-host read BEFORE
             //    launching the shared expert, so the sync returns immediately after routing.
-            let logits = self.gpu.linear(&self.moes[li].router, h2, t, gm);
-            let (_ids, wts, pack) =
-                self.gpu
-                    .moe_route_pack(&logits, h2, t, ne, ne + 1, hidden, topk);
-            // Overlap previous layer's promotion repack with this layer's GPU mixer + router!
-            let ready_promo = pending_promo.take().map(|(prev_li, prev_e, prev_slot)| {
-                let tl = Instant::now();
-                let packed = self.moes[prev_li].experts.repack_one(&self.gguf, prev_e);
-                self.stats.upload_secs += tl.elapsed().as_secs_f64();
-                (prev_li, prev_e, prev_slot, packed)
-            });
-            let ts = Instant::now();
-            let pack_host = self.gpu.read_u32(&pack);
-            self.stats.route_sync_secs += ts.elapsed().as_secs_f64();
-            if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo {
-                let tl = Instant::now();
-                self.moes[prev_li]
-                    .experts
-                    .commit_one(&self.gpu, prev_e, prev_slot, packed);
-                self.moes[prev_li].experts.stamp[prev_slot] = self.clock;
-                self.stats.upload_secs += tl.elapsed().as_secs_f64();
-                self.stats.promotions += 1;
+            let r = self.moe_route_enqueue(li, h2, t);
+            let pack_host = self.moe_sync(&r, pending_promo);
+            if t > 1 {
+                let mut job = self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo);
+                let tc = Instant::now();
+                self.moe_cpu(&mut job);
+                self.stats.cpu_secs += tc.elapsed().as_secs_f64();
+                self.moe_finish(x, job);
+                return Ok(());
             }
+            let Routed { logits, wts, .. } = r;
 
             let ids_host = &pack_host[..npairs];
             let wts_host: &[f32] = bytemuck::cast_slice(&pack_host[npairs..2 * npairs]);
@@ -921,25 +1395,7 @@ impl Model {
                     );
 
                     // 5. LFU cache promotion: defer repack to next layer's GPU mixer window.
-                    let st = &self.moes[li].experts;
-                    if let Some(&best_e) =
-                        miss_experts[..n_miss].iter().max_by_key(|&&e| st.freq[e])
-                    {
-                        let best_f = st.freq[best_e];
-                        let victim = (0..st.slots)
-                            .min_by_key(|&s| {
-                                let cur = st.expert_in[s];
-                                let f = if cur >= 0 { st.freq[cur as usize] } else { 0 };
-                                (f, st.stamp[s])
-                            })
-                            .unwrap();
-                        let cur = st.expert_in[victim];
-                        let cur_f = if cur >= 0 { st.freq[cur as usize] } else { 0 };
-                        let should_promote = (cur_f == 0 && best_f >= 2) || (best_f >= cur_f + 6);
-                        if should_promote {
-                            *pending_promo = Some((li, best_e, victim));
-                        }
-                    }
+                    *pending_promo = self.pick_promo(li, &miss_experts[..n_miss]);
                 } else {
                     self.gpu.moe_combine(
                         x,
@@ -957,116 +1413,6 @@ impl Model {
                 }
                 return Ok(());
             }
-
-            // Multi-token (2..=64) hybrid path.
-            let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); ne];
-            for (p, &e) in ids_host.iter().enumerate() {
-                by_expert[e as usize].push(p as u32);
-            }
-            let mut hit_desc = Vec::new();
-            let mut max_cnt = 0usize;
-            let mut miss_experts: Vec<usize> = Vec::new();
-            let mut hit_wts: Vec<f32> = Vec::new();
-
-            {
-                let st = &mut self.moes[li].experts;
-                for e in 0..ne {
-                    let pairs = &by_expert[e];
-                    if pairs.is_empty() {
-                        continue;
-                    }
-                    self.clock += 1;
-                    st.freq[e] = st.freq[e].saturating_add(pairs.len() as u32);
-                    if st.slot_of[e] >= 0 {
-                        let slot = st.slot_of[e] as usize;
-                        st.stamp[slot] = self.clock;
-                        self.stats.expert_hits += pairs.len() as u64;
-                        for chunk in pairs.chunks(MOE_MAXM) {
-                            max_cnt = max_cnt.max(chunk.len());
-                            hit_desc.push(slot as u32);
-                            hit_desc.push(chunk.len() as u32);
-                            hit_desc
-                                .extend((0..MOE_MAXM).map(|i| chunk.get(i).copied().unwrap_or(0)));
-                        }
-                    } else {
-                        self.stats.expert_misses += pairs.len() as u64;
-                        miss_experts.push(e);
-                    }
-                }
-            }
-
-            // 3. Immediately enqueue shared expert + hit experts on the GPU so they run
-            //    in parallel with CPU execution of the missed experts.
-            let w = &self.moes[li];
-            let g = self.gpu.linear(&w.gate_sh, h2, t, gm);
-            let u = self.gpu.linear(&w.up_sh, h2, t, gm);
-            let a = self.gpu.swiglu(&g, &u, t * c.shared_inter);
-            let sh = self.gpu.linear(&w.down_sh, &a, t, gm);
-
-            let y = self.gpu.alloc(npairs * hidden);
-            if !hit_desc.is_empty() {
-                let act = self.gpu.alloc(npairs * inter);
-                let ntiles = hit_desc.len() / MOE_DESC;
-                let desc_buf = self.gpu.upload_u32(&hit_desc);
-                self.run_experts(li, &desc_buf, ntiles, max_cnt, h2, &act, &y);
-            }
-
-            // 4. Compute missed experts on CPU while GPU runs shared + hit experts.
-            if !miss_experts.is_empty() {
-                hit_wts.extend_from_slice(wts_host);
-                let st = &self.moes[li].experts;
-                let jobs: Vec<CpuExpertJob<'_>> = miss_experts
-                    .iter()
-                    .map(|&e| {
-                        let pairs: Vec<(usize, f32)> = by_expert[e]
-                            .iter()
-                            .map(|&p| {
-                                hit_wts[p as usize] = 0.0;
-                                ((p as usize) / topk, wts_host[p as usize])
-                            })
-                            .collect();
-                        CpuExpertJob {
-                            gate_raw: st.gate.raw(&self.gguf, e),
-                            up_raw: st.up.raw(&self.gguf, e),
-                            down_raw: st.down.raw(&self.gguf, e),
-                            pairs,
-                        }
-                    })
-                    .collect();
-                let tc = Instant::now();
-                let mut cpu_pack = vec![0.0f32; npairs + t * hidden];
-                cpu_pack[..npairs].copy_from_slice(&hit_wts);
-                cpu_moe::run_experts_cpu(
-                    st.gate.info.ty,
-                    st.up.info.ty,
-                    st.down.info.ty,
-                    &jobs,
-                    h2_host,
-                    t,
-                    hidden,
-                    inter,
-                    &mut cpu_pack[npairs..],
-                );
-                self.stats.cpu_secs += tc.elapsed().as_secs_f64();
-                let cpu_pack_buf = self.gpu.upload_f32(&cpu_pack);
-                self.gpu.moe_combine(
-                    x,
-                    &y,
-                    &wts,
-                    &sh,
-                    &logits,
-                    Some(&cpu_pack_buf),
-                    t,
-                    hidden,
-                    topk,
-                    ne + 1,
-                    ne,
-                );
-            } else {
-                self.gpu
-                    .moe_combine(x, &y, &wts, &sh, &logits, None, t, hidden, topk, ne + 1, ne);
-            }
-            return Ok(());
         }
 
         // Large-batch prefill (t > 64): stream missed experts onto GPU in slot-sized rounds.
