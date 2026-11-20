@@ -1,0 +1,5 @@
+# cudarc picks its CUDA driver-API bindings from `nvcc --version` when nvcc is on PATH and
+# panics on toolkits newer than it knows. Nothing here needs nvcc (kernels are compiled to PTX
+# in-process and the driver is loaded dynamically), so pin the bindings instead.
+[env]
+CUDARC_CUDA_VERSION = "13040"

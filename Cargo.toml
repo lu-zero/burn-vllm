@@ -1,0 +1,32 @@
+[package]
+name = "burn-vllm"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cuda", "wgpu"]
+cuda = ["burn-cubecl/cuda"]
+wgpu = ["burn-cubecl/wgpu"]
+
+[dependencies]
+burn-cubecl = { version = "0.23.0-pre.2", default-features = false, features = ["std", "autotune", "persistence"] }
+burn-backend = "0.23.0-pre.2"
+burn-std = "0.23.0-pre.2"
+futures-lite = "2"
+memmap2 = "0.9"
+half = "2"
+bytemuck = "1"
+anyhow = "1"
+fancy-regex = "0.14"
+rayon = "1"
+env_logger = "0.11.11"
+
+[profile.dev]
+debug = "line-tables-only"
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"
