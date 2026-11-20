@@ -7,6 +7,11 @@
 //! - `MXFP4`: w0 = packed nibbles, 4 words per block; w1 = E8M0 exponents, 4 per word.
 //! - `Q5_K`:  w0 = raw 176-byte superblocks (44 words), w1 unused.
 //! - `Q6_K`:  w0 = raw 210-byte superblocks padded to 212 bytes (53 words), w1 unused.
+//! - `BF16`:  w0 = raw bf16 pairs (2 per word), w1 unused.
+//! - `Q4_K`:  w0 = raw 144-byte superblocks (36 words), w1 unused.
+//! - `Q3_K`:  w0 = raw 110-byte superblocks padded to 112 bytes (28 words), w1 unused.
+//! - `IQ3_S`: w0 = raw 110-byte superblocks padded to 112 bytes (28 words), w1 = codebook.
+//! - `IQ2_S`: w0 = raw 82-byte superblocks padded to 84 bytes (21 words), w1 = codebook.
 
 use anyhow::{Result, bail};
 use half::f16;
@@ -17,8 +22,14 @@ pub enum GgmlType {
     F32,
     F16,
     Q8_0,
+    Q3K,
+    Q4K,
     Q5K,
     Q6K,
+    Iq3S,
+    Iq3Xxs,
+    Iq2S,
+    Bf16,
     Mxfp4,
 }
 
@@ -28,8 +39,14 @@ impl GgmlType {
             0 => Self::F32,
             1 => Self::F16,
             8 => Self::Q8_0,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
+            18 => Self::Iq3Xxs,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            30 => Self::Bf16,
             39 => Self::Mxfp4,
             _ => bail!("unsupported ggml type {v}"),
         })
@@ -39,10 +56,15 @@ impl GgmlType {
     pub fn block(self) -> (usize, usize) {
         match self {
             Self::F32 => (1, 4),
-            Self::F16 => (1, 2),
+            Self::F16 | Self::Bf16 => (1, 2),
             Self::Q8_0 => (32, 34),
+            Self::Q3K => (256, 110),
+            Self::Q4K => (256, 144),
             Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
+            Self::Iq3S => (256, 110),
+            Self::Iq3Xxs => (256, 98),
+            Self::Iq2S => (256, 82),
             Self::Mxfp4 => (32, 17),
         }
     }
@@ -61,6 +83,33 @@ impl GgmlType {
             Self::Mxfp4 => fmt::MXFP4,
             Self::Q5K => fmt::Q5K,
             Self::Q6K => fmt::Q6K,
+            Self::Bf16 => fmt::BF16,
+            Self::Q4K => fmt::Q4K,
+            Self::Q3K => fmt::Q3K,
+            Self::Iq3S => fmt::IQ3S,
+            Self::Iq3Xxs => fmt::IQ3XXS,
+            Self::Iq2S => fmt::IQ2S,
+        }
+    }
+
+    /// Whether the GPU layout keeps a per-tensor codebook in w1 (not poolable per expert).
+    pub fn has_codebook(self) -> bool {
+        matches!(self, Self::Iq3S | Self::Iq3Xxs | Self::Iq2S)
+    }
+
+    /// The per-tensor codebook (GPU w1 contents) of a codebook format.
+    pub fn codebook(self) -> Option<Vec<u32>> {
+        use crate::iq_grids::*;
+        match self {
+            Self::Iq3S => Some(IQ3S_GRID.to_vec()),
+            Self::Iq3Xxs => Some(IQ3XXS_GRID.to_vec()),
+            Self::Iq2S => Some(
+                IQ2S_GRID
+                    .iter()
+                    .flat_map(|g| [*g as u32, (*g >> 32) as u32])
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 }
@@ -72,6 +121,12 @@ pub mod fmt {
     pub const MXFP4: u32 = 2;
     pub const Q5K: u32 = 3;
     pub const Q6K: u32 = 4;
+    pub const BF16: u32 = 5;
+    pub const Q4K: u32 = 6;
+    pub const Q3K: u32 = 7;
+    pub const IQ3S: u32 = 8;
+    pub const IQ2S: u32 = 9;
+    pub const IQ3XXS: u32 = 10;
 
     /// u32 words of w0 per 32-element block (K-quants: per 256-element superblock).
     pub fn w0_words(f: u32, numel: usize) -> usize {
@@ -81,6 +136,11 @@ pub mod fmt {
             MXFP4 => numel / 32 * 4,
             Q5K => numel / 256 * 44,
             Q6K => numel / 256 * 53,
+            BF16 => numel / 2,
+            Q4K => numel / 256 * 36,
+            Q3K | IQ3S => numel / 256 * 28,
+            IQ2S => numel / 256 * 21,
+            IQ3XXS => numel / 256 * 25,
             _ => unreachable!(),
         }
     }
@@ -89,6 +149,9 @@ pub mod fmt {
         match f {
             Q8_0 => (numel / 32).div_ceil(2),
             MXFP4 => (numel / 32).div_ceil(4),
+            IQ3S => 512,
+            IQ2S => 2048,
+            IQ3XXS => 256,
             _ => 1,
         }
     }
@@ -190,6 +253,142 @@ pub fn dequant(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                 }
             }
         }
+        GgmlType::Bf16 => {
+            for (o, c) in out.iter_mut().zip(src.chunks_exact(2)) {
+                *o = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+            }
+        }
+        GgmlType::Q4K => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                let scales = &b[4..16];
+                let qs = &b[16..144];
+                for s in 0..8 {
+                    let (sc, m) = scale_min_k4(s, scales);
+                    let (d1, m1) = (d * sc as f32, dmin * m as f32);
+                    let ql = &qs[32 * (s / 2)..];
+                    for l in 0..32 {
+                        let lo = (ql[l] >> (4 * (s & 1))) & 0xF;
+                        y[s * 32 + l] = d1 * lo as f32 - m1;
+                    }
+                }
+            }
+        }
+        GgmlType::Q3K => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                let hm = &b[0..32];
+                let qs = &b[32..96];
+                let sc = &b[96..108];
+                let d = f16::from_le_bytes([b[108], b[109]]).to_f32();
+                for s in 0..8 {
+                    let (n, j) = (s / 4, s % 4);
+                    for half in 0..2 {
+                        let dl = d * q3k_scale(sc, s * 2 + half) as f32;
+                        for l in 0..16 {
+                            let li = half * 16 + l;
+                            let q = (qs[32 * n + li] >> (2 * j)) & 3;
+                            let hi = if hm[li] & (1 << (n * 4 + j)) != 0 {
+                                0
+                            } else {
+                                4
+                            };
+                            y[s * 32 + li] = dl * (q as i32 - hi) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        GgmlType::Iq3S => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                iq3s_block(b, y);
+            }
+        }
+        GgmlType::Iq3Xxs => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                iq3xxs_block(b, y);
+            }
+        }
+        GgmlType::Iq2S => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                iq2s_block(b, y);
+            }
+        }
+    }
+}
+
+/// ksigns_iq2xs: 7 sign bits plus an odd-parity bit in bit 7.
+pub fn ksign(i: usize) -> u8 {
+    (i | (((i.count_ones() as usize) & 1) << 7)) as u8
+}
+
+fn iq3xxs_block(b: &[u8], y: &mut [f32]) {
+    use crate::iq_grids::IQ3XXS_GRID;
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let (qs, gas) = (&b[2..66], &b[66..98]);
+    for s in 0..8 {
+        let aux = u32::from_le_bytes([gas[4 * s], gas[4 * s + 1], gas[4 * s + 2], gas[4 * s + 3]]);
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let sg = ksign(((aux >> (7 * l)) & 127) as usize);
+            let g1 = IQ3XXS_GRID[qs[8 * s + 2 * l] as usize];
+            let g2 = IQ3XXS_GRID[qs[8 * s + 2 * l + 1] as usize];
+            for j in 0..4 {
+                let s1 = if sg & (1 << j) != 0 { -1.0 } else { 1.0 };
+                let s2 = if sg & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                y[s * 32 + l * 8 + j] = db * ((g1 >> (8 * j)) & 0xFF) as f32 * s1;
+                y[s * 32 + l * 8 + 4 + j] = db * ((g2 >> (8 * j)) & 0xFF) as f32 * s2;
+            }
+        }
+    }
+}
+/// Q3_K 6-bit scale `i` (0..16) with the -32 bias applied.
+pub fn q3k_scale(sc: &[u8], i: usize) -> i32 {
+    let (g, k) = (i / 4, i % 4);
+    let low = (sc[(g % 2) * 4 + k] >> ((g / 2) * 4)) & 0xF;
+    let hi = (sc[8 + k] >> (2 * g)) & 3;
+    (low | (hi << 4)) as i32 - 32
+}
+
+fn iq3s_block(b: &[u8], y: &mut [f32]) {
+    use crate::iq_grids::IQ3S_GRID;
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let (qs, qh, signs, scales) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+    for s in 0..8 {
+        let db = d * (1 + 2 * ((scales[s / 2] >> (4 * (s % 2))) & 0xF) as u32) as f32;
+        for l in 0..4 {
+            let g1 =
+                IQ3S_GRID[qs[8 * s + 2 * l] as usize | (((qh[s] as usize) << (8 - 2 * l)) & 256)];
+            let g2 = IQ3S_GRID
+                [qs[8 * s + 2 * l + 1] as usize | (((qh[s] as usize) << (7 - 2 * l)) & 256)];
+            let sg = signs[4 * s + l];
+            for j in 0..4 {
+                let s1 = if sg & (1 << j) != 0 { -1.0 } else { 1.0 };
+                let s2 = if sg & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                y[s * 32 + l * 8 + j] = db * ((g1 >> (8 * j)) & 0xFF) as f32 * s1;
+                y[s * 32 + l * 8 + 4 + j] = db * ((g2 >> (8 * j)) & 0xFF) as f32 * s2;
+            }
+        }
+    }
+}
+
+fn iq2s_block(b: &[u8], y: &mut [f32]) {
+    use crate::iq_grids::IQ2S_GRID;
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let (qs, signs, qh, scales) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+    for s in 0..8 {
+        let db = [
+            d * (0.5 + (scales[s] & 0xF) as f32) * 0.25,
+            d * (0.5 + (scales[s] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let g = IQ2S_GRID[qs[4 * s + l] as usize | (((qh[s] as usize) << (8 - 2 * l)) & 0x300)];
+            let sg = signs[4 * s + l];
+            for j in 0..8 {
+                let sgn = if sg & (1 << j) != 0 { -1.0 } else { 1.0 };
+                y[s * 32 + l * 8 + j] = db[l / 2] * ((g >> (8 * j)) & 0xFF) as f32 * sgn;
+            }
+        }
     }
 }
 
@@ -219,30 +418,58 @@ pub fn repack(ty: GgmlType, src: &[u8]) -> Packed {
         }
         GgmlType::Q8_0 => {
             let w0b: &mut [u8] = bytemuck::cast_slice_mut(&mut w0);
-            w0b.par_chunks_mut(32 * PAR_CHUNK_BLOCKS)
-                .zip(src.par_chunks(34 * PAR_CHUNK_BLOCKS))
-                .for_each(|(dst, s)| {
-                    for (d, b) in dst.chunks_exact_mut(32).zip(s.chunks_exact(34)) {
-                        d.copy_from_slice(&b[2..34]);
-                    }
-                });
             let w1h: &mut [u16] = bytemuck::cast_slice_mut(&mut w1);
-            for (i, b) in src.chunks_exact(34).enumerate() {
-                w1h[i] = u16::from_le_bytes([b[0], b[1]]);
+            if nblocks >= PAR_CHUNK_BLOCKS * 2 {
+                w0b.par_chunks_mut(32 * PAR_CHUNK_BLOCKS)
+                    .zip(w1h.par_chunks_mut(PAR_CHUNK_BLOCKS))
+                    .zip(src.par_chunks(34 * PAR_CHUNK_BLOCKS))
+                    .for_each(|((dst0, dst1), s)| {
+                        for ((d0, d1), b) in dst0
+                            .chunks_exact_mut(32)
+                            .zip(dst1.iter_mut())
+                            .zip(s.chunks_exact(34))
+                        {
+                            *d1 = u16::from_le_bytes([b[0], b[1]]);
+                            d0.copy_from_slice(&b[2..34]);
+                        }
+                    });
+            } else {
+                for ((d0, d1), b) in w0b
+                    .chunks_exact_mut(32)
+                    .zip(w1h.iter_mut())
+                    .zip(src.chunks_exact(34))
+                {
+                    *d1 = u16::from_le_bytes([b[0], b[1]]);
+                    d0.copy_from_slice(&b[2..34]);
+                }
             }
         }
         GgmlType::Mxfp4 => {
             let w0b: &mut [u8] = bytemuck::cast_slice_mut(&mut w0);
-            w0b.par_chunks_mut(16 * PAR_CHUNK_BLOCKS)
-                .zip(src.par_chunks(17 * PAR_CHUNK_BLOCKS))
-                .for_each(|(dst, s)| {
-                    for (d, b) in dst.chunks_exact_mut(16).zip(s.chunks_exact(17)) {
-                        d.copy_from_slice(&b[1..17]);
-                    }
-                });
             let w1b: &mut [u8] = bytemuck::cast_slice_mut(&mut w1);
-            for (i, b) in src.chunks_exact(17).enumerate() {
-                w1b[i] = b[0];
+            if nblocks >= PAR_CHUNK_BLOCKS * 2 {
+                w0b.par_chunks_mut(16 * PAR_CHUNK_BLOCKS)
+                    .zip(w1b.par_chunks_mut(PAR_CHUNK_BLOCKS))
+                    .zip(src.par_chunks(17 * PAR_CHUNK_BLOCKS))
+                    .for_each(|((dst0, dst1), s)| {
+                        for ((d0, d1), b) in dst0
+                            .chunks_exact_mut(16)
+                            .zip(dst1.iter_mut())
+                            .zip(s.chunks_exact(17))
+                        {
+                            *d1 = b[0];
+                            d0.copy_from_slice(&b[1..17]);
+                        }
+                    });
+            } else {
+                for ((d0, d1), b) in w0b
+                    .chunks_exact_mut(16)
+                    .zip(w1b.iter_mut())
+                    .zip(src.chunks_exact(17))
+                {
+                    *d1 = b[0];
+                    d0.copy_from_slice(&b[1..17]);
+                }
             }
         }
         GgmlType::Q6K => {
@@ -251,18 +478,54 @@ pub fn repack(ty: GgmlType, src: &[u8]) -> Packed {
                 d[..210].copy_from_slice(b);
             }
         }
+        GgmlType::Bf16 => copy_words(&mut w0, src),
+        GgmlType::Q4K => copy_words(&mut w0, src),
+        GgmlType::Q3K | GgmlType::Iq3S => {
+            let w0b: &mut [u8] = bytemuck::cast_slice_mut(&mut w0);
+            for (d, b) in w0b.chunks_exact_mut(112).zip(src.chunks_exact(110)) {
+                d[..110].copy_from_slice(b);
+            }
+            if ty == GgmlType::Iq3S {
+                w1.copy_from_slice(&crate::iq_grids::IQ3S_GRID);
+            }
+        }
+        GgmlType::Iq2S => {
+            let w0b: &mut [u8] = bytemuck::cast_slice_mut(&mut w0);
+            for (d, b) in w0b.chunks_exact_mut(84).zip(src.chunks_exact(82)) {
+                d[..82].copy_from_slice(b);
+            }
+            for (i, g) in crate::iq_grids::IQ2S_GRID.iter().enumerate() {
+                w1[2 * i] = *g as u32;
+                w1[2 * i + 1] = (*g >> 32) as u32;
+            }
+        }
+        GgmlType::Iq3Xxs => {
+            let w0b: &mut [u8] = bytemuck::cast_slice_mut(&mut w0);
+            for (d, b) in w0b.chunks_exact_mut(100).zip(src.chunks_exact(98)) {
+                d[..98].copy_from_slice(b);
+            }
+            w1.copy_from_slice(&crate::iq_grids::IQ3XXS_GRID);
+        }
     }
     Packed { fmt: f, w0, w1 }
 }
 
 fn copy_words(dst: &mut [u32], src: &[u8]) {
-    dst.par_chunks_mut(1 << 16)
-        .zip(src.par_chunks(4 << 16))
-        .for_each(|(d, s)| {
-            for (o, c) in d.iter_mut().zip(s.chunks_exact(4)) {
-                *o = u32::from_le_bytes(c.try_into().unwrap());
-            }
-        });
+    #[cfg(target_endian = "little")]
+    {
+        let dst_b: &mut [u8] = bytemuck::cast_slice_mut(dst);
+        dst_b.copy_from_slice(&src[..dst_b.len()]);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        dst.par_chunks_mut(1 << 16)
+            .zip(src.par_chunks(4 << 16))
+            .for_each(|(d, s)| {
+                for (o, c) in d.iter_mut().zip(s.chunks_exact(4)) {
+                    *o = u32::from_le_bytes(c.try_into().unwrap());
+                }
+            });
+    }
 }
 
 #[cfg(test)]

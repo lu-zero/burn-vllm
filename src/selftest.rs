@@ -1,6 +1,7 @@
 //! GPU kernels vs straightforward CPU references, using real tensors from the GGUF for
 //! every quant format the model uses.
 
+use crate::cpu_moe::{self, CpuExpertJob};
 use crate::gguf::Gguf;
 use crate::gpu::{Buf, Gpu, QWeight};
 use crate::kernels::{MOE_DESC, MOE_MAXM};
@@ -197,6 +198,32 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
         e = (e + 1) % 256;
         std::hint::black_box(repack_all(e));
     });
+    for n_exp in [1usize, 2, 3, 4] {
+        let x = rng.vec(2048);
+        let mut out = vec![0.0f32; 2048];
+        let jobs: Vec<CpuExpertJob<'_>> = (0..n_exp)
+            .map(|i| {
+                let raw = |ti: usize| {
+                    let per = ts[ti].nbytes / 256;
+                    &g.bytes(ts[ti])[i * per..(i + 1) * per]
+                };
+                CpuExpertJob {
+                    gate_raw: raw(0),
+                    up_raw: raw(1),
+                    down_raw: raw(2),
+                    pairs: vec![(0, 0.25)],
+                }
+            })
+            .collect();
+        let us = time(&format!("cpu_moe x{n_exp} (MXFP4+Q5_K)"), 50, &mut || {
+            cpu_moe::run_experts_cpu(
+                ts[0].ty, ts[1].ty, ts[2].ty, &jobs, &x, 1, 2048, 512, &mut out,
+            );
+            std::hint::black_box(&out);
+        });
+        let bytes: usize = ts.iter().map(|t| t.nbytes / 256).sum::<usize>() * n_exp;
+        println!("{:<40} {:>9.1} GB/s", "", bytes as f64 / us / 1e3);
+    }
     let pools: Vec<Buf> = ts
         .iter()
         .map(|t| gpu.alloc(t.nbytes / 4 / 256 * 64))
@@ -330,8 +357,17 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
             Some(5),
             384,
         ),
+        ("BF16 output", "output.weight", None, 257),
+        ("Q4_K attn_qkv", "blk.0.attn_qkv.weight", None, 257),
+        ("IQ2_S ffn_gate", "blk.0.ffn_gate.weight", None, 257),
+        ("IQ3_S ffn_down", "blk.0.ffn_down.weight", None, 129),
+        ("exps gate L1", "blk.1.ffn_gate_exps.weight", Some(2), 257),
+        ("exps down L1", "blk.1.ffn_down_exps.weight", Some(2), 257),
     ];
     for (label, name, e, rows) in cases {
+        if g.tensor(name).is_err() {
+            continue;
+        }
         let (ty, k, raw) = slice(g, name, e, rows)?;
         let mut wf = vec![0f32; rows * k];
         quant::dequant(ty, raw, &mut wf);
@@ -342,6 +378,15 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
             &wf,
             1e-6,
         )?;
+        {
+            let x = rng.vec(k);
+            let want = cpu_matmul(&wf, &x, rows, k, 1);
+            let rb = ty.row_bytes(k);
+            let got: Vec<f32> = (0..rows)
+                .map(|r| cpu_moe::dot(ty, &raw[r * rb..(r + 1) * rb], &x))
+                .collect();
+            check(&format!("{label} cpu_moe::dot"), &got, &want, 1e-2)?;
+        }
         for m in [1usize, 3, 8, 13, 40] {
             let x = rng.vec(m * k);
             let want = cpu_matmul(&wf, &x, rows, k, m);
@@ -367,7 +412,9 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
         }
     }
     slot_write_test(gpu)?;
-    moe_test(gpu, g, &mut rng)?;
+    if g.tensor("blk.0.ffn_gate_exps.weight").is_ok() {
+        moe_test(gpu, g, &mut rng)?;
+    }
     gdn_test(gpu, &mut rng)?;
     attn_test(gpu, &mut rng)?;
     println!("selftest passed");
@@ -435,7 +482,10 @@ fn moe_test(gpu: &Gpu, g: &Gguf, rng: &mut Rng) -> Result<()> {
                 0
             };
             let w0 = gpu.zeros(w0p * slots);
-            let w1 = gpu.zeros((w1p * slots).max(1));
+            let w1 = match ty.codebook() {
+                Some(cb) => gpu.upload_u32(&cb),
+                None => gpu.zeros((w1p * slots).max(1)),
+            };
             let mut per_expert = Vec::new();
             for (i, &e) in experts.iter().enumerate() {
                 let (ty, raw) = load(name, e)?;

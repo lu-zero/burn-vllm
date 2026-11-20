@@ -90,25 +90,41 @@ pub fn decode_block(w0: &[u32], w1: &[u32], b: usize, vals: &mut Array<f32>, #[c
                 vals[16 + i * 4 + k] = d * mxfp4_val(byte >> 4);
             }
         }
+    } else if comptime!(fmt == 5) {
+        // BF16: 2 per word, 16 words per 32-block.
+        #[unroll]
+        for i in 0..16usize {
+            let w = w0[b * 16 + i];
+            vals[i * 2] = f32::reinterpret(w << 16);
+            vals[i * 2 + 1] = f32::reinterpret(w & 0xFFFF0000);
+        }
     } else {
-        decode_kquant16(w0, b, 0, vals, 0usize, fmt);
-        decode_kquant16(w0, b, 1, vals, 16usize, fmt);
+        decode_kquant16(w0, w1, b, 0, vals, 0usize, fmt);
+        decode_kquant16(w0, w1, b, 1, vals, 16usize, fmt);
     }
 }
 
-/// Decode values `[16*half, 16*half + 16)` of K-quant 32-block `b` into `vals[off..off+16]`.
+/// Decode values `[16*half, 16*half + 16)` of K-/IQ-quant 32-block `b` into `vals[off..off+16]`.
+/// `w1` is the per-tensor codebook for the IQ formats.
 #[cube]
 pub fn decode_kquant16(
     w0: &[u32],
+    w1: &[u32],
     b: usize,
     half: usize,
     vals: &mut Array<f32>,
     #[comptime] off: usize,
     #[comptime] fmt: u32,
 ) {
-    if comptime!(fmt == 3) {
-        // Q5_K: 44 words per superblock: d|dmin, scales[12], qh[32], qs[128].
-        let base = (b / 8) * 44;
+    if comptime!(fmt == 3 || fmt == 6) {
+        // Q5_K (44 words: d|dmin, scales[12], qh[32], qs[128]) and
+        // Q4_K (36 words: d|dmin, scales[12], qs[128]).
+        let words = if comptime!(fmt == 3) {
+            44usize
+        } else {
+            36usize
+        };
+        let base = (b / 8) * words;
         let s = b % 8;
         let dd = w0[base];
         let d = f16_to_f32(dd & 0xFFFF);
@@ -122,21 +138,34 @@ pub fn decode_kquant16(
         let d1 = d * f32::cast_from(sc);
         let m1 = dmin * f32::cast_from(mn);
         let nib_shift = ((s % 2) * 4) as u32;
-        let qh_shift = s as u32;
-        let ql_base = base + 12 + (s / 2) * 8 + half * 4;
-        let qh_base = base + 4 + half * 4;
-        #[unroll]
-        for i in 0..4usize {
-            let ql = w0[ql_base + i];
-            let qh = w0[qh_base + i];
+        if comptime!(fmt == 3) {
+            let qh_shift = s as u32;
+            let ql_base = base + 12 + (s / 2) * 8 + half * 4;
+            let qh_base = base + 4 + half * 4;
             #[unroll]
-            for k in 0..4usize {
-                let lo = (ql >> (comptime!((k * 8) as u32) + nib_shift)) & 0xF;
-                let hi = ((qh >> (comptime!((k * 8) as u32) + qh_shift)) & 1) << 4;
-                vals[off + i * 4 + k] = d1 * f32::cast_from(lo | hi) - m1;
+            for i in 0..4usize {
+                let ql = w0[ql_base + i];
+                let qh = w0[qh_base + i];
+                #[unroll]
+                for k in 0..4usize {
+                    let lo = (ql >> (comptime!((k * 8) as u32) + nib_shift)) & 0xF;
+                    let hi = ((qh >> (comptime!((k * 8) as u32) + qh_shift)) & 1) << 4;
+                    vals[off + i * 4 + k] = d1 * f32::cast_from(lo | hi) - m1;
+                }
+            }
+        } else {
+            let ql_base = base + 4 + (s / 2) * 8 + half * 4;
+            #[unroll]
+            for i in 0..4usize {
+                let ql = w0[ql_base + i];
+                #[unroll]
+                for k in 0..4usize {
+                    let lo = (ql >> (comptime!((k * 8) as u32) + nib_shift)) & 0xF;
+                    vals[off + i * 4 + k] = d1 * f32::cast_from(lo) - m1;
+                }
             }
         }
-    } else {
+    } else if comptime!(fmt == 4) {
         // Q6_K: 53 words per (padded) superblock: ql[128], qh[64], scales[16], d.
         let base = (b / 8) * 53;
         let s = b % 8;
@@ -158,6 +187,122 @@ pub fn decode_kquant16(
                 let hi = ((qh >> (comptime!((k * 8) as u32) + qh_shift)) & 3) << 4;
                 let q = i32::cast_from(lo | hi) - 32;
                 vals[off + i * 4 + k] = scale * f32::cast_from(q);
+            }
+        }
+    } else if comptime!(fmt == 7) {
+        // Q3_K: 28 words per (padded) superblock: hmask[32], qs[64], scales[12], d.
+        let base = (b / 8) * 28;
+        let s = b % 8;
+        let n = s / 4;
+        let j = s % 4;
+        let d = f16_to_f32(w0[base + 27] & 0xFFFF);
+        let si = s * 2 + half;
+        let g = si / 4;
+        let k4 = si % 4;
+        let low = (byte_at(w0, base + 24, (g % 2) * 4 + k4) >> (((g / 2) * 4) as u32)) & 0xF;
+        let hi2 = (byte_at(w0, base + 24, 8 + k4) >> ((g * 2) as u32)) & 3;
+        let sc = i32::cast_from(low | (hi2 << 4)) - 32;
+        let dl = d * f32::cast_from(sc);
+        let q_base = base + 8 + n * 8 + half * 4;
+        let h_base = base + half * 4;
+        let q_shift = (j * 2) as u32;
+        let h_shift = (n * 4 + j) as u32;
+        #[unroll]
+        for i in 0..4usize {
+            let qw = w0[q_base + i];
+            let hw = w0[h_base + i];
+            #[unroll]
+            for k in 0..4usize {
+                let q = (qw >> (comptime!((k * 8) as u32) + q_shift)) & 3;
+                let h = (hw >> (comptime!((k * 8) as u32) + h_shift)) & 1;
+                vals[off + i * 4 + k] = dl * (f32::cast_from(q + 4 * h) - 4.0);
+            }
+        }
+    } else if comptime!(fmt == 8) {
+        // IQ3_S: 28 words per (padded) superblock: d, qs[64], qh[8], signs[32], scales[4].
+        let base = (b / 8) * 28;
+        let s = b % 8;
+        let d = f16_to_f32(w0[base] & 0xFFFF);
+        let sbyte = byte_at(w0, base, 106 + s / 2);
+        let db = d * f32::cast_from(1 + 2 * ((sbyte >> (((s % 2) * 4) as u32)) & 0xF));
+        let qhb = byte_at(w0, base, 66 + s);
+        #[unroll]
+        for ll in 0..2usize {
+            let l = half * 2 + ll;
+            let q1 = byte_at(w0, base, 2 + 8 * s + 2 * l);
+            let q2 = byte_at(w0, base, 2 + 8 * s + 2 * l + 1);
+            let i1 = (q1 | ((qhb << ((8 - 2 * l) as u32)) & 256)) as usize;
+            let i2 = (q2 | ((qhb << ((7 - 2 * l) as u32)) & 256)) as usize;
+            let g1 = w1[i1];
+            let g2 = w1[i2];
+            let sg = byte_at(w0, base, 74 + 4 * s + l);
+            #[unroll]
+            for j in 0..4usize {
+                let s1 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!(j as u32)) & 1);
+                let s2 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!((j + 4) as u32)) & 1);
+                let v1 = f32::cast_from((g1 >> comptime!((8 * j) as u32)) & 0xFF);
+                let v2 = f32::cast_from((g2 >> comptime!((8 * j) as u32)) & 0xFF);
+                vals[off + ll * 8 + j] = db * v1 * s1;
+                vals[off + ll * 8 + 4 + j] = db * v2 * s2;
+            }
+        }
+    } else if comptime!(fmt == 10) {
+        // IQ3_XXS: 25 words per (padded) superblock: d, qs[64], gas[32] (sign+scale words).
+        let base = (b / 8) * 25;
+        let s = b % 8;
+        let d = f16_to_f32(w0[base] & 0xFFFF);
+        let a0 = byte_at(w0, base, 66 + 4 * s);
+        let a1 = byte_at(w0, base, 66 + 4 * s + 1);
+        let a2 = byte_at(w0, base, 66 + 4 * s + 2);
+        let a3 = byte_at(w0, base, 66 + 4 * s + 3);
+        let aux = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24);
+        let db = d * (0.5 + f32::cast_from(aux >> 28)) * 0.5;
+        #[unroll]
+        for ll in 0..2usize {
+            let l = half * 2 + ll;
+            let sidx = (aux >> ((7 * l) as u32)) & 127;
+            let p1 = sidx ^ (sidx >> 4);
+            let p2 = p1 ^ (p1 >> 2);
+            let p3 = p2 ^ (p2 >> 1);
+            let sg = sidx | ((p3 & 1) << 7);
+            let q1 = byte_at(w0, base, 2 + 8 * s + 2 * l);
+            let q2 = byte_at(w0, base, 2 + 8 * s + 2 * l + 1);
+            let g1 = w1[q1 as usize];
+            let g2 = w1[q2 as usize];
+            #[unroll]
+            for j in 0..4usize {
+                let s1 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!(j as u32)) & 1);
+                let s2 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!((j + 4) as u32)) & 1);
+                let v1 = f32::cast_from((g1 >> comptime!((8 * j) as u32)) & 0xFF);
+                let v2 = f32::cast_from((g2 >> comptime!((8 * j) as u32)) & 0xFF);
+                vals[off + ll * 8 + j] = db * v1 * s1;
+                vals[off + ll * 8 + 4 + j] = db * v2 * s2;
+            }
+        }
+    } else {
+        // IQ2_S: 21 words per (padded) superblock: d, qs[32], signs[32], qh[8], scales[8].
+        let base = (b / 8) * 21;
+        let s = b % 8;
+        let d = f16_to_f32(w0[base] & 0xFFFF);
+        let sbyte = byte_at(w0, base, 74 + s);
+        let db = d * (0.5 + f32::cast_from((sbyte >> ((half * 4) as u32)) & 0xF)) * 0.25;
+        let qhb = byte_at(w0, base, 66 + s);
+        #[unroll]
+        for ll in 0..2usize {
+            let l = half * 2 + ll;
+            let q = byte_at(w0, base, 2 + 4 * s + l);
+            let gi = ((q | ((qhb << ((8 - 2 * l) as u32)) & 0x300)) as usize) * 2;
+            let glo = w1[gi];
+            let ghi = w1[gi + 1];
+            let sg = byte_at(w0, base, 34 + 4 * s + l);
+            #[unroll]
+            for j in 0..4usize {
+                let s1 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!(j as u32)) & 1);
+                let s2 = 1.0 - 2.0 * f32::cast_from((sg >> comptime!((j + 4) as u32)) & 1);
+                let v1 = f32::cast_from((glo >> comptime!((8 * j) as u32)) & 0xFF);
+                let v2 = f32::cast_from((ghi >> comptime!((8 * j) as u32)) & 0xFF);
+                vals[off + ll * 8 + j] = db * v1 * s1;
+                vals[off + ll * 8 + 4 + j] = db * v2 * s2;
             }
         }
     }
@@ -284,35 +429,41 @@ fn row_dot(
             u += nl;
         }
     } else if comptime!(fmt == 1) {
-        // Q8_0, one weight word (4 int8) per lane step: lanes read consecutive words and
-        // consecutive activation vec4s, so both streams coalesce.
-        let words = kb * 8;
-        let base = row * words;
+        // Q8_0: one 128-bit V4u load (16 int8 weights = half a 32-block) per lane step,
+        // 2x unrolled for memory-level parallelism with 100% coalesced 512B warp loads.
+        let vecs = kb * 2;
+        let base = row * vecs;
         let mut u0 = lane;
-        while u0 < words {
+        while u0 < vecs {
             #[unroll]
-            for r in 0..4usize {
+            for r in 0..2usize {
                 let u = u0 + r * nl;
-                if u < words {
-                    let wi = base + u;
-                    let b = wi / 8;
+                if u < vecs {
+                    let vi = base + u;
+                    let b = vi / 2;
                     let d = f16_to_f32((w1[b / 2] >> (((b % 2) * 16) as u32)) & 0xFFFF);
-                    let w = w0[wi];
+                    let wv = w0v[vi];
+                    let xo = u * 4;
                     #[unroll]
                     for mi in 0..maxm {
                         if mi < cnt {
-                            let x = xv[xrow[mi] + u];
                             let mut s = 0.0f32;
                             #[unroll]
-                            for j in 0..4usize {
-                                s += sext8((w >> comptime!((j * 8) as u32)) & 0xFF) * x.extract(j);
+                            for wi in 0..4usize {
+                                let w = wv.extract(wi);
+                                let x = xv[xrow[mi] + xo + wi];
+                                #[unroll]
+                                for j in 0..4usize {
+                                    s += sext8((w >> comptime!((j * 8) as u32)) & 0xFF)
+                                        * x.extract(j);
+                                }
                             }
                             acc[mi] += d * s;
                         }
                     }
                 }
             }
-            u0 += 4 * nl;
+            u0 += 2 * nl;
         }
     } else if comptime!(fmt == 2) {
         // MXFP4, one word (8 nibbles: 4 low-half + 4 high-half values) per lane step.
@@ -329,7 +480,6 @@ fn row_dot(
                     let e = (w1[b / 4] >> (((b % 4) * 8) as u32)) & 0xFF;
                     let d = select(e < 2, 0.0f32, f32::reinterpret((max(e, 1u32) - 1) << 23));
                     let w = w0[wi];
-                    // vec4 offset of the low-half values within the row
                     let xo = (u / 4) * 8 + u % 4;
                     #[unroll]
                     for mi in 0..maxm {
@@ -350,6 +500,33 @@ fn row_dot(
             }
             u0 += 4 * nl;
         }
+    } else if comptime!(fmt == 5) {
+        // BF16: one 128-bit load (8 weights) per lane step.
+        let units = k / 8;
+        let base = row * units;
+        let mut u = lane;
+        while u < units {
+            let w = w0v[base + u];
+            #[unroll]
+            for mi in 0..maxm {
+                if mi < cnt {
+                    let xa = xv[xrow[mi] + u * 2];
+                    let xb = xv[xrow[mi] + u * 2 + 1];
+                    let mut s = 0.0f32;
+                    #[unroll]
+                    for j in 0..2usize {
+                        let wa = w.extract(j);
+                        let wb = w.extract(j + 2);
+                        s += f32::reinterpret(wa << 16) * xa.extract(j * 2)
+                            + f32::reinterpret(wa & 0xFFFF0000) * xa.extract(j * 2 + 1)
+                            + f32::reinterpret(wb << 16) * xb.extract(j * 2)
+                            + f32::reinterpret(wb & 0xFFFF0000) * xb.extract(j * 2 + 1);
+                    }
+                    acc[mi] += s;
+                }
+            }
+            u += nl;
+        }
     } else {
         // K-quants: half a sub-block (16 values) per lane step, so the per-sub-block
         // scale decode is amortized over 16 weights.
@@ -357,7 +534,7 @@ fn row_dot(
         let base = row * kb;
         let mut u = lane;
         while u < units {
-            decode_kquant16(w0, base + u / 2, u % 2, &mut vals, 0usize, fmt);
+            decode_kquant16(w0, w1, base + u / 2, u % 2, &mut vals, 0usize, fmt);
             #[unroll]
             for mi in 0..maxm {
                 if mi < cnt {
@@ -856,6 +1033,86 @@ pub fn moe_route(
     }
 }
 
+/// Top-k routing + pack `(ids, wts, h2)` into one contiguous u32 buffer so the host can
+/// read all three in a single device-to-host sync.
+/// grid: (T, 1, 1), cube: 256.
+/// pack layout: `[ids: T*topk | wts_bits: T*topk | h2_bits: T*hidden]`.
+#[cube(launch)]
+pub fn moe_route_pack(
+    logits: &[f32],
+    h2: &[u32],
+    ids: &mut [u32],
+    wts: &mut [f32],
+    pack: &mut [u32],
+    t: u32,
+    ne: u32,
+    stride: u32,
+    hidden: u32,
+    #[comptime] topk: usize,
+) {
+    let tok = CUBE_POS_X as usize;
+    let tid = UNIT_POS as usize;
+    let nt = CUBE_DIM as usize;
+    let t_u = t as usize;
+    let hidden_u = hidden as usize;
+    if tok < t_u {
+        if tid == 0 {
+            let base = tok * stride as usize;
+            let ne = ne as usize;
+            let mut sel = Array::<u32>::new(topk);
+            let mut val = Array::<f32>::new(topk);
+            #[unroll]
+            for i in 0..topk {
+                sel[i] = 0;
+                val[i] = f32::new(-1.0e30);
+            }
+            for e in 0..ne {
+                let v = logits[base + e];
+                if v > val[topk - 1] {
+                    let mut cur_v = v;
+                    let mut cur_i = e as u32;
+                    #[unroll]
+                    for i in 0..topk {
+                        if cur_v > val[i] {
+                            let tv = val[i];
+                            let ti = sel[i];
+                            val[i] = cur_v;
+                            sel[i] = cur_i;
+                            cur_v = tv;
+                            cur_i = ti;
+                        }
+                    }
+                }
+            }
+            let mx = val[0];
+            let mut sum = 0.0f32;
+            #[unroll]
+            for i in 0..topk {
+                let e = f32::exp(val[i] - mx);
+                val[i] = e;
+                sum += e;
+            }
+            let wts_off = t_u * topk;
+            #[unroll]
+            for i in 0..topk {
+                let p = tok * topk + i;
+                let w = val[i] / sum;
+                ids[p] = sel[i];
+                wts[p] = w;
+                pack[p] = sel[i];
+                pack[wts_off + p] = u32::reinterpret(w);
+            }
+        }
+        let h2_off = 2 * t_u * topk + tok * hidden_u;
+        let src_off = tok * hidden_u;
+        let mut d = tid;
+        while d < hidden_u {
+            pack[h2_off + d] = h2[src_off + d];
+            d += nt;
+        }
+    }
+}
+
 /// Device-side descriptors for one (token, k) pair per tile with slot = expert id.
 #[cube(launch)]
 pub fn moe_direct_desc(ids: &[u32], desc: &mut [u32], npairs: u32) {
@@ -1000,7 +1257,9 @@ pub fn moe_down(
     }
 }
 
-/// x[t, d] += sum_k wts[t, k] * y[t*topk + k, d] + sigmoid(logits[t, gate_col]) * shared[t, d]
+/// x[t, d] += (y_cpu[t, d] if has_cpu) + sum_k wts[t, k] * y[t*topk + k, d]
+///          + sigmoid(logits[t, gate_col]) * shared[t, d]
+/// When `has_cpu`, `cpu_pack` holds `[hit_wts: T*topk | y_cpu: T*hidden]` in one buffer.
 #[cube(launch)]
 pub fn moe_combine(
     x: &mut [f32],
@@ -1008,11 +1267,14 @@ pub fn moe_combine(
     wts: &[f32],
     shared: &[f32],
     logits: &[f32],
+    cpu_pack: &[f32],
     hidden: u32,
     total: u32,
     topk: u32,
     stride: u32,
     gate_col: u32,
+    npairs: u32,
+    #[comptime] has_cpu: bool,
 ) {
     let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if i < total as usize {
@@ -1021,9 +1283,23 @@ pub fn moe_combine(
         let t = i / hidden;
         let d = i % hidden;
         let mut s = 0.0f32;
-        for kk in 0..topk {
-            let p = t * topk + kk;
-            s += wts[p] * y[p * hidden + d];
+        if comptime!(has_cpu) {
+            s = cpu_pack[npairs as usize + i];
+            for kk in 0..topk {
+                let p = t * topk + kk;
+                let w = cpu_pack[p];
+                if w != 0.0 {
+                    s += w * y[p * hidden + d];
+                }
+            }
+        } else {
+            for kk in 0..topk {
+                let p = t * topk + kk;
+                let w = wts[p];
+                if w != 0.0 {
+                    s += w * y[p * hidden + d];
+                }
+            }
         }
         let sg = sigmoid(logits[t * stride as usize + gate_col as usize]);
         x[i] += s + sg * shared[i];

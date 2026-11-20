@@ -1,5 +1,7 @@
+mod cpu_moe;
 mod gguf;
 mod gpu;
+mod iq_grids;
 mod kernels;
 mod model;
 mod quant;
@@ -208,6 +210,9 @@ fn main() -> Result<()> {
         if let Some(line) = st.summary() {
             eprintln!("{phase} experts: {line}");
         }
+    }
+    if let Some(p) = model.prof.summary() {
+        eprintln!("{p}");
     }
     Ok(())
 }

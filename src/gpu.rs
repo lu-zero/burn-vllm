@@ -504,6 +504,38 @@ impl Gpu {
         (ids, wts)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route_pack(
+        &self,
+        logits: &Buf,
+        h2: &Buf,
+        t: usize,
+        ne: usize,
+        stride: usize,
+        hidden: usize,
+        topk: usize,
+    ) -> (Buf, Buf, Buf) {
+        let ids = self.alloc(t * topk);
+        let wts = self.alloc(t * topk);
+        let pack = self.alloc(t * (2 * topk + hidden));
+        kernels::moe_route_pack::launch(
+            &self.client,
+            CubeCount::Static(t as u32, 1, 1),
+            CubeDim::new_1d(WG),
+            logits.arg(),
+            h2.arg(),
+            ids.arg(),
+            wts.arg(),
+            pack.arg(),
+            t as u32,
+            ne as u32,
+            stride as u32,
+            hidden as u32,
+            topk,
+        );
+        (ids, wts, pack)
+    }
+
     pub fn moe_direct_desc(&self, ids: &Buf, npairs: usize) -> Buf {
         let desc = self.alloc(npairs * MOE_DESC);
         kernels::moe_direct_desc::launch(
@@ -593,6 +625,7 @@ impl Gpu {
         wts: &Buf,
         shared: &Buf,
         logits: &Buf,
+        cpu_pack: Option<&Buf>,
         t: usize,
         hidden: usize,
         topk: usize,
@@ -600,6 +633,11 @@ impl Gpu {
         gate_col: usize,
     ) {
         let total = t * hidden;
+        let npairs = t * topk;
+        let (cpu_buf, has_cpu) = match cpu_pack {
+            Some(b) => (b, true),
+            None => (shared, false),
+        };
         kernels::moe_combine::launch(
             &self.client,
             grid_1d(total),
@@ -609,11 +647,14 @@ impl Gpu {
             wts.arg(),
             shared.arg(),
             logits.arg(),
+            cpu_buf.arg(),
             hidden as u32,
             total as u32,
             topk as u32,
             stride as u32,
             gate_col as u32,
+            npairs as u32,
+            has_cpu,
         );
     }
 
