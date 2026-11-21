@@ -27,7 +27,23 @@ cargo build --release
 
 Options: `--model PATH`, `--temp/--top-k/--top-p/--seed` (`--temp 0` = greedy), `--ctx N`,
 `--chunk N` (prefill chunk), `--vram-gb F` (budget used to size the expert cache),
-`--expert-slots N` (per layer; 256 = all resident), `--no-think`, `--raw`.
+`--expert-slots N` (per layer; 256 = all resident), `--mtp K`, `--no-think`, `--raw`.
+
+### OpenAI-compatible server
+
+```sh
+./target/release/burn-vllm --serve 127.0.0.1:8000 --temp 0.7
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"stream":true}'
+```
+
+Endpoints: `POST /v1/chat/completions` (streaming and not, `stop`, `max_tokens` /
+`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stream_options.include_usage`,
+`chat_template_kwargs.enable_thinking`), `POST /v1/completions` (raw prompt, no chat template),
+`GET /v1/models`. The `model` field is accepted and ignored; the served name is the GGUF's file
+name. Limits: one sequence at a time (requests queue), `n` must be 1, and `tools` are ignored.
+With thinking on (the default), the model's reasoning is returned in `reasoning_content` (chat
+message and stream deltas) and the answer in `content`; the `<think>` tags are not returned.
 
 ## Layout
 
@@ -40,3 +56,5 @@ Options: `--model PATH`, `--temp/--top-k/--top-p/--seed` (`--temp 0` = greedy), 
 | `src/model.rs` | Qwen3.5 MoE weights, expert residency, forward pass |
 | `src/tokenizer.rs` | byte-level BPE from GGUF metadata (qwen35 pre-tokenizer) |
 | `src/selftest.rs` | kernel correctness checks |
+| `src/generate.rs` | one generation turn (prefill, greedy / sampled / MTP decode) shared by the CLI and server; chat template |
+| `src/server.rs` | OpenAI-compatible HTTP API on axum; one engine thread owns the model |

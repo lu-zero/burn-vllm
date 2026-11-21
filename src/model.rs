@@ -473,7 +473,7 @@ mod mtp;
 
 pub struct State {
     pub pos: usize,
-    max_ctx: usize,
+    pub max_ctx: usize,
     pub page_table: Vec<u32>,
     page_table_buf: Buf,
     pub tokens: Vec<u32>,
