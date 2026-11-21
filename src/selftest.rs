@@ -6,7 +6,9 @@ use crate::gguf::Gguf;
 use crate::gpu::{Buf, Gpu, QWeight};
 use crate::kernels::{MOE_DESC, MOE_MAXM};
 use crate::quant::{self, GgmlType};
+use crate::radix::{GdnCheckpoint, KV_PAGE_SIZE, KvPool, RadixTree};
 use anyhow::{Result, ensure};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Per-kernel decode-shape timings (device-synchronized averages).
@@ -419,6 +421,9 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
     }
     gdn_test(gpu, &mut rng)?;
     attn_test(gpu, &mut rng)?;
+    argmax_test(gpu, &mut rng)?;
+    paged_attn_test(gpu, &mut rng)?;
+    radix_test(gpu)?;
     println!("selftest passed");
     Ok(())
 }
@@ -860,5 +865,215 @@ fn attn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
         pos0 += t;
     }
     let _: Option<Buf> = None;
+    Ok(())
+}
+
+fn argmax_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
+    let (rows, n) = (4usize, 248_320usize);
+    let data = rng.vec(rows * n);
+    let buf = gpu.upload_f32(&data);
+    let got = gpu.argmax_rows(&buf, rows, n);
+    for r in 0..rows {
+        let row = &data[r * n..(r + 1) * n];
+        let mut want = 0usize;
+        for (i, &v) in row.iter().enumerate() {
+            if v > row[want] {
+                want = i;
+            }
+        }
+        ensure!(
+            got[r] == want as u32,
+            "argmax row {r}: got {}, want {want}",
+            got[r]
+        );
+    }
+    println!("ok   argmax_rows {rows}x{n}");
+    Ok(())
+}
+
+fn paged_attn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
+    let (nh, nkv, hd, rope_dim, theta, eps) =
+        (4usize, 2usize, 256usize, 64usize, 1.0e7f32, 1e-6f32);
+    let num_pages = 2060usize; // > 32768 tokens (2048 pages)
+    let pool = KvPool::new(gpu, 1, num_pages, nkv, hd);
+    // Permuted page table so logical pages map non-contiguously into physical pages.
+    let mut page_table: Vec<u32> = (0..num_pages as u32).collect();
+    for i in 0..num_pages {
+        let j = (i * 131 + 17) % num_pages;
+        page_table.swap(i, j);
+    }
+    let pt_buf = gpu.upload_u32(&page_table);
+    let q_norm = rng.vec(hd);
+    let k_norm = rng.vec(hd);
+    let qn_b = gpu.upload_f32(&q_norm);
+    let kn_b = gpu.upload_f32(&k_norm);
+    let norm_rope = |x: &[f32], w: &[f32], pos: usize| -> Vec<f32> {
+        let ms = x.iter().map(|a| a * a).sum::<f32>() / hd as f32;
+        let xn: Vec<f32> = x
+            .iter()
+            .zip(w)
+            .map(|(a, b)| a / (ms + eps).sqrt() * b)
+            .collect();
+        let mut y = xn.clone();
+        let half = rope_dim / 2;
+        for i in 0..half {
+            let f = theta.powf(-2.0 * i as f32 / rope_dim as f32);
+            let (s, c) = (pos as f32 * f).sin_cos();
+            y[i] = xn[i] * c - xn[i + half] * s;
+            y[i + half] = xn[i + half] * c + xn[i] * s;
+        }
+        y
+    };
+
+    // Populate 32768 keys in chunks of 1024, then verify decode at pos0=1100 (split-K) and pos0=32768 (>=32k).
+    let total_keys = 32769usize;
+    let mut cpu_k = vec![0f32; total_keys * nkv * hd];
+    let mut cpu_v = vec![0f32; total_keys * nkv * hd];
+    let mut pos0 = 0usize;
+    let steps = [1100usize, 1, 31667, 1];
+    for &t in &steps {
+        let qg = rng.vec(t * nh * 2 * hd);
+        let k = rng.vec(t * nkv * hd);
+        let v = rng.vec(t * nkv * hd);
+        let qg_b = gpu.upload_f32(&qg);
+        let q = gpu.attn_prep_paged(
+            &qg_b,
+            &gpu.upload_f32(&k),
+            &gpu.upload_f32(&v),
+            &qn_b,
+            &kn_b,
+            &pool.k_pools[0],
+            &pool.v_pools[0],
+            &pt_buf,
+            t,
+            nh,
+            nkv,
+            hd,
+            pos0,
+            KV_PAGE_SIZE,
+            rope_dim,
+            theta,
+            eps,
+        );
+        for ti in 0..t {
+            let p = pos0 + ti;
+            for kh in 0..nkv {
+                let kr = norm_rope(
+                    &k[(ti * nkv + kh) * hd..(ti * nkv + kh + 1) * hd],
+                    &k_norm,
+                    p,
+                );
+                cpu_k[(p * nkv + kh) * hd..(p * nkv + kh + 1) * hd].copy_from_slice(&kr);
+                cpu_v[(p * nkv + kh) * hd..(p * nkv + kh + 1) * hd]
+                    .copy_from_slice(&v[(ti * nkv + kh) * hd..(ti * nkv + kh + 1) * hd]);
+            }
+        }
+        if t == 1 {
+            let o = gpu.attention_paged(
+                &q,
+                &qg_b,
+                &pool.k_pools[0],
+                &pool.v_pools[0],
+                &pt_buf,
+                t,
+                nh,
+                nkv,
+                hd,
+                pos0,
+                KV_PAGE_SIZE,
+            );
+            let p = pos0;
+            let mut want = vec![0f32; nh * hd];
+            for h in 0..nh {
+                let kvh = h / (nh / nkv);
+                let base = h * 2 * hd;
+                let q_cpu = norm_rope(&qg[base..base + hd], &q_norm, p);
+                let scores: Vec<f32> = (0..=p)
+                    .map(|s| {
+                        (0..hd)
+                            .map(|d| q_cpu[d] * cpu_k[(s * nkv + kvh) * hd + d])
+                            .sum::<f32>()
+                            / (hd as f32).sqrt()
+                    })
+                    .collect();
+                let mx = scores.iter().cloned().fold(f32::MIN, f32::max);
+                let e: Vec<f32> = scores.iter().map(|s| (s - mx).exp()).collect();
+                let sum: f32 = e.iter().sum();
+                for d in 0..hd {
+                    let a: f32 = (0..=p)
+                        .map(|s| e[s] * cpu_v[(s * nkv + kvh) * hd + d])
+                        .sum::<f32>()
+                        / sum;
+                    let gate = qg[base + hd + d];
+                    want[h * hd + d] = a / (1.0 + (-gate).exp());
+                }
+            }
+            check(
+                &format!("paged_attention fp16 t=1 pos0={pos0}"),
+                &gpu.read_f32(&o),
+                &want,
+                3e-3,
+            )?;
+        }
+        pos0 += t;
+    }
+    Ok(())
+}
+
+fn radix_test(gpu: &Gpu) -> Result<()> {
+    let mut pool = KvPool::new(gpu, 1, 6, 2, 256);
+    let mut radix = RadixTree::new(4);
+    let mk_ckpt = |v: f32| {
+        Arc::new(GdnCheckpoint {
+            conv: vec![Some(vec![v; 4])],
+            ssm: vec![Some(vec![v; 4])],
+            last_hidden: Some(vec![v; 8]),
+        })
+    };
+    // Insert 2 pages (32 tokens): [0..32]
+    let p0 = pool.alloc_page(&mut radix).unwrap();
+    let p1 = pool.alloc_page(&mut radix).unwrap();
+    let toks_a: Vec<u32> = (0..32).collect();
+    radix.insert_prefix(&toks_a, &[p0, p1], Some(mk_ckpt(1.0)), &mut pool);
+    pool.unpin(p0);
+    pool.unpin(p1);
+    ensure!(pool.free_count() == 4, "expected 4 free pages");
+
+    // Match diverging at token 20 (page 0 matches = 16 tokens; splits node [0..32] -> [0..16] + [16..32]).
+    // Wait: node [0..32] had GDN checkpoint only at 32, so require_gdn=false matches 16 tokens,
+    // and matching exact 32+1 tokens with require_gdn=true matches all 32 tokens + checkpoint!
+    let mut toks_a_ext = toks_a.clone();
+    toks_a_ext.push(999);
+    let m = radix.match_prefix(&toks_a_ext, &mut pool, true, true);
+    ensure!(
+        m.matched_tokens == 32 && m.pages == vec![p0, p1],
+        "exact prefix hit"
+    );
+    ensure!(m.gdn_ckpt.as_ref().unwrap().conv[0].as_ref().unwrap()[0] == 1.0);
+    for p in m.pages {
+        pool.unpin(p);
+    }
+
+    // Insert overlapping branch [0..16, 100..116] (splits [0..32] at 16)
+    let p2 = pool.alloc_page(&mut radix).unwrap();
+    let p3 = pool.alloc_page(&mut radix).unwrap();
+    let mut toks_b: Vec<u32> = (0..16).collect();
+    toks_b.extend(100..116);
+    radix.insert_prefix(&toks_b, &[p2, p3], Some(mk_ckpt(2.0)), &mut pool);
+    pool.unpin(p2);
+    pool.unpin(p3);
+
+    // Allocate remaining 2 free pages + 2 more forcing LRU eviction of unpinned radix leaves.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(
+            pool.alloc_page(&mut radix)
+                .expect("eviction should free pages"),
+        );
+    }
+    for p in held {
+        pool.unpin(p);
+    }
+    println!("ok   radix tree + paged kv eviction");
     Ok(())
 }

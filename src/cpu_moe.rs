@@ -82,6 +82,16 @@ impl QuantX {
         self.qs.resize(x.len(), 0);
         self.d.resize(nb, 0.0);
         self.bsum.resize(nb, 0.0);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+        {
+            unsafe {
+                avx2::quantize_into_avx2(x, &mut self.qs, &mut self.d, &mut self.bsum);
+            }
+            return;
+        }
         for (bi, xc) in x.chunks_exact(32).enumerate() {
             let mut amax = 0.0f32;
             let mut sum = 0.0f32;
@@ -270,6 +280,61 @@ mod avx2 {
         _mm_cvtss_f32(s)
     }
 
+    #[inline(always)]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn hmax256_ps(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let m = _mm_max_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(m);
+        let m = _mm_max_ps(m, shuf);
+        let shuf = _mm_movehl_ps(shuf, m);
+        let m = _mm_max_ss(m, shuf);
+        _mm_cvtss_f32(m)
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn quantize_into_avx2(x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
+        unsafe {
+            let nb = x.len() / 32;
+            let abs_mask = _mm256_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            let clamp_lo = _mm256_set1_epi8(-127);
+            let inv127 = 1.0f32 / 127.0;
+            let xp = x.as_ptr();
+            let qp = qs.as_mut_ptr();
+            let dp = d.as_mut_ptr();
+            let bp = bsum.as_mut_ptr();
+            for bi in 0..nb {
+                let p = xp.add(bi * 32);
+                let v0 = _mm256_loadu_ps(p);
+                let v1 = _mm256_loadu_ps(p.add(8));
+                let v2 = _mm256_loadu_ps(p.add(16));
+                let v3 = _mm256_loadu_ps(p.add(24));
+
+                let s01 = _mm256_add_ps(v0, v1);
+                let s23 = _mm256_add_ps(v2, v3);
+                *bp.add(bi) = hsum256_ps(_mm256_add_ps(s01, s23));
+
+                let m01 = _mm256_max_ps(_mm256_and_ps(v0, abs_mask), _mm256_and_ps(v1, abs_mask));
+                let m23 = _mm256_max_ps(_mm256_and_ps(v2, abs_mask), _mm256_and_ps(v3, abs_mask));
+                let amax = hmax256_ps(_mm256_max_ps(m01, m23));
+                let scale = amax * inv127;
+                *dp.add(bi) = scale;
+                let vinv = _mm256_set1_ps(if scale > 0.0 { 1.0 / scale } else { 0.0 });
+
+                let i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vinv));
+                let i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vinv));
+                let i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vinv));
+                let i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vinv));
+                let p01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8);
+                let p23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i2, i3), 0xD8);
+                let packed = _mm256_permute4x64_epi64(_mm256_packs_epi16(p01, p23), 0xD8);
+                let clamped = _mm256_max_epi8(packed, clamp_lo);
+                _mm256_storeu_si256(qp.add(bi * 32) as *mut __m256i, clamped);
+            }
+        }
+    }
+
     /// Signed 32 x `i8` dot product (where `a` is in `[-127, 127]` or `b` is in `[-127, 127]`):
     /// returns 8 `i32` partial sums.
     #[inline(always)]
@@ -334,6 +399,110 @@ mod avx2 {
         }
     }
 
+    /// Fused gate+up MXFP4 dot product sharing one activation load per block.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_mxfp4_q8_gu(g_src: &[u8], u_src: &[u8], qx: &QuantX) -> (f32, f32) {
+        unsafe {
+            let nb = qx.d.len();
+            debug_assert!(g_src.len() >= nb * 17 && u_src.len() >= nb * 17);
+            let lut128 = _mm_loadu_si128(MXFP4_VALUES.as_ptr() as *const __m128i);
+            let lut = _mm256_broadcastsi128_si256(lut128);
+            let mask0f = _mm256_set1_epi8(0x0F);
+            let ones = _mm256_set1_epi16(1);
+            let mut g_acc = _mm256_setzero_ps();
+            let mut u_acc = _mm256_setzero_ps();
+            let mut gp = g_src.as_ptr();
+            let mut up = u_src.as_ptr();
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for b in 0..nb {
+                let dx = *dp.add(b);
+                let x = _mm256_loadu_si256(qp as *const __m256i);
+
+                let dg = _mm256_set1_ps(*E8M0_LUT.get_unchecked(*gp as usize) * dx);
+                let rawg = _mm_loadu_si128(gp.add(1) as *const __m128i);
+                let idxg =
+                    _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(rawg, 4), rawg), mask0f);
+                let qg = _mm256_shuffle_epi8(lut, idxg);
+                let pg = _mm256_cvtepi32_ps(dot32_i8_i8(qg, x, ones));
+                g_acc = _mm256_fmadd_ps(dg, pg, g_acc);
+
+                let du = _mm256_set1_ps(*E8M0_LUT.get_unchecked(*up as usize) * dx);
+                let rawu = _mm_loadu_si128(up.add(1) as *const __m128i);
+                let idxu =
+                    _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(rawu, 4), rawu), mask0f);
+                let qu = _mm256_shuffle_epi8(lut, idxu);
+                let pu = _mm256_cvtepi32_ps(dot32_i8_i8(qu, x, ones));
+                u_acc = _mm256_fmadd_ps(du, pu, u_acc);
+
+                gp = gp.add(17);
+                up = up.add(17);
+                qp = qp.add(32);
+            }
+            (hsum256_ps(g_acc), hsum256_ps(u_acc))
+        }
+    }
+
+    /// Multi-token fused gate+up MXFP4 dot product for 2..=4 activation vectors, decoding
+    /// each weight row once.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_mxfp4_q8_gu_batch(
+        g_src: &[u8],
+        u_src: &[u8],
+        qxs: &[&QuantX],
+        g_out: &mut [f32],
+        u_out: &mut [f32],
+    ) {
+        unsafe {
+            let k = qxs.len();
+            let nb = qxs[0].d.len();
+            let lut128 = _mm_loadu_si128(MXFP4_VALUES.as_ptr() as *const __m128i);
+            let lut = _mm256_broadcastsi128_si256(lut128);
+            let mask0f = _mm256_set1_epi8(0x0F);
+            let ones = _mm256_set1_epi16(1);
+            let mut g_acc = [_mm256_setzero_ps(); 4];
+            let mut u_acc = [_mm256_setzero_ps(); 4];
+            let mut gp = g_src.as_ptr();
+            let mut up = u_src.as_ptr();
+            for b in 0..nb {
+                let eg = *E8M0_LUT.get_unchecked(*gp as usize);
+                let rawg = _mm_loadu_si128(gp.add(1) as *const __m128i);
+                let idxg =
+                    _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(rawg, 4), rawg), mask0f);
+                let qg = _mm256_shuffle_epi8(lut, idxg);
+                let axg = _mm256_sign_epi8(qg, qg);
+
+                let eu = *E8M0_LUT.get_unchecked(*up as usize);
+                let rawu = _mm_loadu_si128(up.add(1) as *const __m128i);
+                let idxu =
+                    _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(rawu, 4), rawu), mask0f);
+                let qu = _mm256_shuffle_epi8(lut, idxu);
+                let axu = _mm256_sign_epi8(qu, qu);
+
+                for ti in 0..k {
+                    let qx = qxs.get_unchecked(ti);
+                    let dx = *qx.d.get_unchecked(b);
+                    let x = _mm256_loadu_si256(qx.qs.as_ptr().add(b * 32) as *const __m256i);
+                    let syg = _mm256_sign_epi8(x, qg);
+                    let pg =
+                        _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(axg, syg), ones));
+                    g_acc[ti] = _mm256_fmadd_ps(_mm256_set1_ps(eg * dx), pg, g_acc[ti]);
+
+                    let syu = _mm256_sign_epi8(x, qu);
+                    let pu =
+                        _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(axu, syu), ones));
+                    u_acc[ti] = _mm256_fmadd_ps(_mm256_set1_ps(eu * dx), pu, u_acc[ti]);
+                }
+                gp = gp.add(17);
+                up = up.add(17);
+            }
+            for ti in 0..k {
+                g_out[ti] = hsum256_ps(g_acc[ti]);
+                u_out[ti] = hsum256_ps(u_acc[ti]);
+            }
+        }
+    }
+
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_q5k_q8(src: &[u8], qx: &QuantX) -> f32 {
         unsafe {
@@ -395,6 +564,61 @@ mod avx2 {
                 }
             }
             hsum256_ps(acc) - min_acc
+        }
+    }
+
+    /// Multi-pair Q5_K dot product for 2..=4 activation vectors, decoding each weight
+    /// superblock once.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_q5k_q8_batch(src: &[u8], qxs: &[&QuantX], out: &mut [f32]) {
+        unsafe {
+            let k = qxs.len();
+            let nsb = qxs[0].d.len() / 8;
+            let mask0f = _mm256_set1_epi8(0x0F);
+            let bit4 = _mm256_set1_epi8(0x10);
+            let ones = _mm256_set1_epi16(1);
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut min_acc = [0.0f32; 4];
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 176);
+                let d = f16_bits_to_f32(u16::from_le_bytes([*b, *b.add(1)]));
+                let dmin = f16_bits_to_f32(u16::from_le_bytes([*b.add(2), *b.add(3)]));
+                let scales = std::slice::from_raw_parts(b.add(4), 12);
+                let qh = _mm256_loadu_si256(b.add(16) as *const __m256i);
+                let qs = b.add(48);
+                let mut hm = _mm256_set1_epi8(1);
+                let base_bi = sb * 8;
+                for pair in 0..4usize {
+                    let ql = _mm256_loadu_si256(qs.add(pair * 32) as *const __m256i);
+                    for odd in 0..2usize {
+                        let s = pair * 2 + odd;
+                        let bi = base_bi + s;
+                        let (sc, m) = scale_min_k4(s, scales);
+                        let h =
+                            _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, hm), hm), bit4);
+                        let q = if odd == 0 {
+                            _mm256_or_si256(_mm256_and_si256(ql, mask0f), h)
+                        } else {
+                            _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql, 4), mask0f), h)
+                        };
+                        let dsc = d * (sc as f32);
+                        let dmn = dmin * (m as f32);
+                        for ti in 0..k {
+                            let qx = qxs.get_unchecked(ti);
+                            let x =
+                                _mm256_loadu_si256(qx.qs.as_ptr().add(bi * 32) as *const __m256i);
+                            let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q, x), ones);
+                            let scale = _mm256_set1_ps(dsc * *qx.d.get_unchecked(bi));
+                            acc[ti] = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(p32), acc[ti]);
+                            min_acc[ti] += dmn * *qx.bsum.get_unchecked(bi);
+                        }
+                        hm = _mm256_add_epi8(hm, hm);
+                    }
+                }
+            }
+            for ti in 0..k {
+                out[ti] = hsum256_ps(acc[ti]) - min_acc[ti];
+            }
         }
     }
 
@@ -776,6 +1000,20 @@ pub fn run_experts_cpu_decode(
         let qx0: &QuantX = qx0;
         let acts_slice = &mut acts[..m * inter];
 
+        let has_avx2 = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
+                    && is_x86_feature_detected!("f16c")
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                false
+            }
+        };
+        let fused_mxfp4 = has_avx2 && gate_ty == GgmlType::Mxfp4 && up_ty == GgmlType::Mxfp4;
+
         MOE_POOL.install(|| {
             // Pass 1: gate + up + silu across all missed experts in one parallel dispatch.
             acts_slice
@@ -788,49 +1026,60 @@ pub fn run_experts_cpu_decode(
                         let mi = idx / inter;
                         let r = idx % inter;
                         let job = &jobs[mi];
-                        let g = dot_q8(
-                            gate_ty,
-                            &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes],
-                            qx0,
-                            x0,
-                        );
-                        let u = dot_q8(
-                            up_ty,
-                            &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes],
-                            qx0,
-                            x0,
-                        );
+                        let g_row = &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes];
+                        let u_row = &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes];
+                        let (g, u) = if fused_mxfp4 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                avx2::dot_mxfp4_q8_gu(g_row, u_row, qx0)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            unreachable!()
+                        } else {
+                            (
+                                dot_q8(gate_ty, g_row, qx0, x0),
+                                dot_q8(up_ty, u_row, qx0, x0),
+                            )
+                        };
                         *o = silu(g) * u;
                     }
                 });
 
-            for mi in 0..m {
-                qacts[mi].quantize_into(&acts_slice[mi * inter..(mi + 1) * inter]);
+            if m <= 16 {
+                for mi in 0..m {
+                    qacts[mi].quantize_into(&acts_slice[mi * inter..(mi + 1) * inter]);
+                }
+            } else {
+                qacts[..m].par_iter_mut().enumerate().for_each(|(mi, q)| {
+                    q.quantize_into(&acts_slice[mi * inter..(mi + 1) * inter]);
+                });
             }
             let qacts_ref = &qacts[..m];
 
             // Pass 2: down projection + weighted sum into `out[0..hidden]`.
+            // Stream each expert sequentially across a 64-row tile to preserve hardware prefetching.
             out[..hidden]
                 .par_chunks_mut(64)
                 .enumerate()
                 .for_each(|(ci, dst)| {
                     let d0 = ci * 64;
-                    for (k, o) in dst.iter_mut().enumerate() {
-                        let d = d0 + k;
-                        let off = d * down_row_bytes;
-                        let mut s = 0.0f32;
-                        for (mi, job) in jobs.iter().enumerate() {
-                            let act = &acts_slice[mi * inter..(mi + 1) * inter];
-                            s += job.weight
+                    let mut acc = [0.0f32; 64];
+                    for (mi, job) in jobs.iter().enumerate() {
+                        let act = &acts_slice[mi * inter..(mi + 1) * inter];
+                        let qa = &qacts_ref[mi];
+                        let wt = job.weight;
+                        for k in 0..dst.len() {
+                            let off = (d0 + k) * down_row_bytes;
+                            acc[k] += wt
                                 * dot_q8(
                                     down_ty,
                                     &job.down_raw[off..off + down_row_bytes],
-                                    &qacts_ref[mi],
+                                    qa,
                                     act,
                                 );
                         }
-                        *o = s;
                     }
+                    dst.copy_from_slice(&acc[..dst.len()]);
                 });
         });
     });
@@ -854,79 +1103,274 @@ pub fn run_experts_cpu(
         return;
     }
     if t == 1 {
-        let djobs: Vec<CpuDecodeJob<'_>> = jobs
-            .iter()
-            .map(|j| CpuDecodeJob {
-                gate_raw: j.gate_raw,
-                up_raw: j.up_raw,
-                down_raw: j.down_raw,
-                weight: j.pairs[0].1,
-            })
-            .collect();
-        run_experts_cpu_decode(gate_ty, up_ty, down_ty, &djobs, x, hidden, inter, out);
-        return;
+        let mut djobs = [CpuDecodeJob {
+            gate_raw: &[],
+            up_raw: &[],
+            down_raw: &[],
+            weight: 0.0,
+        }; 16];
+        if jobs.len() <= djobs.len() {
+            for (i, j) in jobs.iter().enumerate() {
+                djobs[i] = CpuDecodeJob {
+                    gate_raw: j.gate_raw,
+                    up_raw: j.up_raw,
+                    down_raw: j.down_raw,
+                    weight: j.pairs[0].1,
+                };
+            }
+            run_experts_cpu_decode(
+                gate_ty,
+                up_ty,
+                down_ty,
+                &djobs[..jobs.len()],
+                x,
+                hidden,
+                inter,
+                out,
+            );
+            return;
+        }
     }
     let gate_row_bytes = gate_ty.row_bytes(hidden);
     let up_row_bytes = up_ty.row_bytes(hidden);
     let down_row_bytes = down_ty.row_bytes(inter);
 
-    // General multi-token path (prefill chunks, speculative verify windows): quantize each
-    // token's activation once, then split the work by (expert, row) so every thread streams
-    // an expert row once for all tokens routed to it.
-    let qxs: Vec<QuantX> = (0..t)
-        .map(|tok| QuantX::from_f32(&x[tok * hidden..(tok + 1) * hidden]))
-        .collect();
-    let mut off = Vec::with_capacity(jobs.len() + 1);
-    off.push(0usize);
-    for j in jobs {
-        off.push(off.last().unwrap() + j.pairs.len() * inter);
+    struct MultiScratch {
+        qxs: Vec<QuantX>,
+        acts: Vec<f32>,
+        qacts: Vec<QuantX>,
+        off: Vec<usize>,
     }
-    let mut acts = vec![0.0f32; *off.last().unwrap()];
-    let acts_ptr = acts.as_mut_ptr() as usize;
-    MOE_POOL.install(|| {
-        // Pass 1: gate + up + silu for every (expert, row, pair).
-        (0..jobs.len() * inter)
-            .into_par_iter()
-            .with_min_len(16)
-            .for_each(|idx| {
-                let (ji, r) = (idx / inter, idx % inter);
-                let job = &jobs[ji];
-                let g_row = &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes];
-                let u_row = &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes];
-                let dst = acts_ptr as *mut f32;
-                for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
-                    let xt = &x[tok * hidden..(tok + 1) * hidden];
-                    let g = dot_q8(gate_ty, g_row, &qxs[tok], xt);
-                    let u = dot_q8(up_ty, u_row, &qxs[tok], xt);
-                    // SAFETY: each (job, pair, row) slot is written by exactly one task.
-                    unsafe { *dst.add(off[ji] + pi * inter + r) = silu(g) * u };
+    thread_local! {
+        static MULTI_SCRATCH: RefCell<MultiScratch> = RefCell::new(MultiScratch {
+            qxs: Vec::new(),
+            acts: Vec::new(),
+            qacts: Vec::new(),
+            off: Vec::new(),
+        });
+    }
+
+    let has_avx2 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    let fused_mxfp4 = has_avx2 && gate_ty == GgmlType::Mxfp4 && up_ty == GgmlType::Mxfp4;
+    let batch_q5k = has_avx2 && down_ty == GgmlType::Q5K;
+
+    MULTI_SCRATCH.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        while sc.qxs.len() < t {
+            sc.qxs.push(QuantX::new());
+        }
+        sc.off.clear();
+        sc.off.push(0usize);
+        let mut total_pairs = 0usize;
+        for j in jobs {
+            total_pairs += j.pairs.len();
+            sc.off.push(total_pairs * inter);
+        }
+        let total_acts = total_pairs * inter;
+        if sc.acts.len() < total_acts {
+            sc.acts.resize(total_acts, 0.0);
+        }
+        while sc.qacts.len() < total_pairs {
+            sc.qacts.push(QuantX::new());
+        }
+
+        let MultiScratch {
+            qxs,
+            acts,
+            qacts,
+            off,
+        } = &mut *sc;
+        let qxs_slice = &mut qxs[..t];
+        let acts_slice = &mut acts[..total_acts];
+        let qacts_slice = &mut qacts[..total_pairs];
+        let off_slice = &off[..jobs.len() + 1];
+
+        let acts_ptr = acts_slice.as_mut_ptr() as usize;
+
+        MOE_POOL.install(|| {
+            if t <= 4 {
+                for (tok, q) in qxs_slice.iter_mut().enumerate() {
+                    q.quantize_into(&x[tok * hidden..(tok + 1) * hidden]);
+                }
+            } else {
+                qxs_slice.par_iter_mut().enumerate().for_each(|(tok, q)| {
+                    q.quantize_into(&x[tok * hidden..(tok + 1) * hidden]);
+                });
+            }
+            let qxs_ref: &[QuantX] = qxs_slice;
+
+            // Pass 1: gate + up + silu for every (expert, row, pair).
+            (0..jobs.len() * inter)
+                .into_par_iter()
+                .with_min_len(16)
+                .for_each(|idx| {
+                    let (ji, r) = (idx / inter, idx % inter);
+                    let job = &jobs[ji];
+                    let g_row = &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes];
+                    let u_row = &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes];
+                    let dst = acts_ptr as *mut f32;
+                    let np = job.pairs.len();
+                    if fused_mxfp4 && np == 1 {
+                        let tok = job.pairs[0].0;
+                        #[cfg(target_arch = "x86_64")]
+                        let (g, u) = unsafe { avx2::dot_mxfp4_q8_gu(g_row, u_row, &qxs_ref[tok]) };
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let (g, u) = unreachable!();
+                        unsafe { *dst.add(off_slice[ji] + r) = silu(g) * u };
+                    } else if fused_mxfp4 && (2..=4).contains(&np) {
+                        let mut qptrs = [&qxs_ref[0]; 4];
+                        for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
+                            qptrs[pi] = &qxs_ref[tok];
+                        }
+                        let mut gs = [0.0f32; 4];
+                        let mut us = [0.0f32; 4];
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            avx2::dot_mxfp4_q8_gu_batch(
+                                g_row,
+                                u_row,
+                                &qptrs[..np],
+                                &mut gs[..np],
+                                &mut us[..np],
+                            );
+                        }
+                        for pi in 0..np {
+                            unsafe {
+                                *dst.add(off_slice[ji] + pi * inter + r) = silu(gs[pi]) * us[pi];
+                            }
+                        }
+                    } else {
+                        for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
+                            let xt = &x[tok * hidden..(tok + 1) * hidden];
+                            let (g, u) = if fused_mxfp4 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    avx2::dot_mxfp4_q8_gu(g_row, u_row, &qxs_ref[tok])
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                unreachable!()
+                            } else {
+                                (
+                                    dot_q8(gate_ty, g_row, &qxs_ref[tok], xt),
+                                    dot_q8(up_ty, u_row, &qxs_ref[tok], xt),
+                                )
+                            };
+                            unsafe { *dst.add(off_slice[ji] + pi * inter + r) = silu(g) * u };
+                        }
+                    }
+                });
+
+            if total_pairs <= 16 {
+                for (pidx, q) in qacts_slice.iter_mut().enumerate() {
+                    let s = pidx * inter;
+                    q.quantize_into(&acts_slice[s..s + inter]);
+                }
+            } else {
+                qacts_slice
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(pidx, q)| {
+                        let s = pidx * inter;
+                        q.quantize_into(&acts_slice[s..s + inter]);
+                    });
+            }
+            let qacts_ref: &[QuantX] = qacts_slice;
+            let pair_off: Vec<usize> = {
+                let mut v = Vec::with_capacity(jobs.len());
+                let mut acc_p = 0usize;
+                for j in jobs {
+                    v.push(acc_p);
+                    acc_p += j.pairs.len();
+                }
+                v
+            };
+
+            // Pass 2: down projection, tiled in 64-column chunks so each expert streams
+            // sequentially across 64 rows without ping-ponging across weight buffers.
+            let out_ptr = out.as_mut_ptr() as usize;
+            let ntiles = hidden.div_ceil(64);
+            (0..ntiles).into_par_iter().for_each(|ci| {
+                let d0 = ci * 64;
+                let len = (hidden - d0).min(64);
+                let dst = out_ptr as *mut f32;
+                if t <= 8 {
+                    let mut acc = [[0.0f32; 64]; 8];
+                    for (ji, job) in jobs.iter().enumerate() {
+                        let p0 = pair_off[ji];
+                        let np = job.pairs.len();
+                        if batch_q5k && (2..=4).contains(&np) {
+                            let mut qptrs = [&qacts_ref[0]; 4];
+                            for pi in 0..np {
+                                qptrs[pi] = &qacts_ref[p0 + pi];
+                            }
+                            let mut ys = [0.0f32; 4];
+                            for k in 0..len {
+                                let off = (d0 + k) * down_row_bytes;
+                                let d_row = &job.down_raw[off..off + down_row_bytes];
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    avx2::dot_q5k_q8_batch(d_row, &qptrs[..np], &mut ys[..np]);
+                                }
+                                for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
+                                    acc[tok][k] += wt * ys[pi];
+                                }
+                            }
+                        } else {
+                            for k in 0..len {
+                                let off = (d0 + k) * down_row_bytes;
+                                let d_row = &job.down_raw[off..off + down_row_bytes];
+                                for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
+                                    let s = (p0 + pi) * inter;
+                                    let y = wt
+                                        * dot_q8(
+                                            down_ty,
+                                            d_row,
+                                            &qacts_ref[p0 + pi],
+                                            &acts_slice[s..s + inter],
+                                        );
+                                    acc[tok][k] += y;
+                                }
+                            }
+                        }
+                    }
+                    for tok in 0..t {
+                        for k in 0..len {
+                            unsafe { *dst.add(tok * hidden + d0 + k) += acc[tok][k] };
+                        }
+                    }
+                } else {
+                    for (ji, job) in jobs.iter().enumerate() {
+                        let p0 = pair_off[ji];
+                        for k in 0..len {
+                            let d = d0 + k;
+                            let off = d * down_row_bytes;
+                            let d_row = &job.down_raw[off..off + down_row_bytes];
+                            for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
+                                let s = (p0 + pi) * inter;
+                                let y = wt
+                                    * dot_q8(
+                                        down_ty,
+                                        d_row,
+                                        &qacts_ref[p0 + pi],
+                                        &acts_slice[s..s + inter],
+                                    );
+                                unsafe { *dst.add(tok * hidden + d) += y };
+                            }
+                        }
+                    }
                 }
             });
-        let qacts: Vec<Vec<QuantX>> = jobs
-            .iter()
-            .enumerate()
-            .map(|(ji, job)| {
-                (0..job.pairs.len())
-                    .map(|pi| {
-                        let s = off[ji] + pi * inter;
-                        QuantX::from_f32(&acts[s..s + inter])
-                    })
-                    .collect()
-            })
-            .collect();
-        // Pass 2: down projection, accumulated per output column so tasks never share one.
-        let out_ptr = out.as_mut_ptr() as usize;
-        (0..hidden).into_par_iter().with_min_len(16).for_each(|d| {
-            let dst = out_ptr as *mut f32;
-            for (ji, job) in jobs.iter().enumerate() {
-                let d_row = &job.down_raw[d * down_row_bytes..(d + 1) * down_row_bytes];
-                for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
-                    let s = off[ji] + pi * inter;
-                    let y = wt * dot_q8(down_ty, d_row, &qacts[ji][pi], &acts[s..s + inter]);
-                    // SAFETY: column `d` of every token row belongs to this task alone.
-                    unsafe { *dst.add(tok * hidden + d) += y };
-                }
-            }
         });
     });
 }

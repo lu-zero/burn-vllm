@@ -26,6 +26,25 @@ pub fn f16_to_f32(h: u32) -> f32 {
 }
 
 #[cube]
+pub fn f32_to_f16(x: f32) -> u32 {
+    let bits = u32::reinterpret(x);
+    let sign = (bits >> 16) & 0x8000u32;
+    let abs = bits & 0x7FFF_FFFFu32;
+    let exp = abs >> 23;
+    let mant = abs & 0x007F_FFFFu32;
+    let sub_m = (0x0080_0000u32 | mant) >> (126u32 - min(exp, 126u32));
+    let norm_e = (max(exp, 112u32) - 112u32) << 10;
+    let rbit = (mant >> 12) & 1u32;
+    let norm = norm_e + (mant >> 13) + rbit;
+    let val = select(
+        abs >= 0x477F_E000u32,
+        0x7BFFu32,
+        select(exp < 103u32, 0u32, select(exp < 113u32, sub_m, norm)),
+    );
+    sign | val
+}
+
+#[cube]
 fn sext8(byte: u32) -> f32 {
     f32::cast_from(i32::reinterpret(byte << 24) >> 24)
 }
@@ -466,7 +485,8 @@ fn row_dot(
             u0 += 2 * nl;
         }
     } else if comptime!(fmt == 2) {
-        // MXFP4, one word (8 nibbles: 4 low-half + 4 high-half values) per lane step.
+        // MXFP4, one word (8 nibbles: 4 low-half + 4 high-half values) per lane step,
+        // 4x unrolled for memory-level parallelism.
         let words = kb * 4;
         let base = row * words;
         let mut u0 = lane;
@@ -1083,6 +1103,193 @@ pub fn attention_combine(
     out[(t * nh + h) * hd + d] = acc / l * sigmoid(gate);
 }
 
+/// Paged FP16-packed variant of [`attn_prep`]: scatters K and V into physical pages
+/// (`[num_pages, page_size, NKV, HD/2]` u32, 2x f16 per word) via `page_table`.
+#[cube(launch)]
+pub fn attn_prep_paged(
+    qg: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    q_out: &mut [f32],
+    k_pool: &mut [u32],
+    v_pool: &mut [u32],
+    page_table: &[u32],
+    nh: u32,
+    nkv: u32,
+    pos0: u32,
+    page_size: u32,
+    rope_dim: u32,
+    theta: f32,
+    eps: f32,
+    #[comptime] hd: usize,
+) {
+    let mut smem = Shared::<[f32]>::new_slice(MAX_PLANES);
+    let mut buf = Shared::<[f32]>::new_slice(hd);
+    let head = CUBE_POS_X as usize;
+    let t = CUBE_POS_Y as usize;
+    let d = UNIT_POS as usize;
+    let nh = nh as usize;
+    let nkv = nkv as usize;
+    let is_q = head < nh;
+    let x = if is_q {
+        qg[(t * nh + head) * 2 * hd + d]
+    } else {
+        k[(t * nkv + head - nh) * hd + d]
+    };
+    let wn = if is_q { q_norm[d] } else { k_norm[d] };
+    let ss = cube_sum(x * x, &mut smem);
+    let xn = x / f32::sqrt(ss / f32::cast_from(hd) + eps) * wn;
+    buf[d] = xn;
+    sync_cube();
+    let rd = rope_dim as usize;
+    let half = rd / 2;
+    let pos = f32::cast_from(pos0 as usize + t);
+    let mut y = xn;
+    if d < rd {
+        let i = d % half;
+        let freq = f32::exp(-f32::ln(theta) * 2.0 * f32::cast_from(i) / f32::cast_from(rd));
+        let ang = pos * freq;
+        let c = f32::cos(ang);
+        let s = f32::sin(ang);
+        if d < half {
+            y = xn * c - buf[d + half] * s;
+        } else {
+            y = xn * c + buf[d - half] * s;
+        }
+    }
+    if is_q {
+        q_out[(t * nh + head) * hd + d] = y;
+    } else {
+        let kvh = head - nh;
+        let p = pos0 as usize + t;
+        let page_sz = page_size as usize;
+        let page = page_table[p / page_sz] as usize;
+        let off = p % page_sz;
+        let vv = v[(t * nkv + kvh) * hd + d];
+        let y_pair = plane_shuffle_xor(y, 1);
+        let v_pair = plane_shuffle_xor(vv, 1);
+        if d % 2 == 0 {
+            let dst = ((page * page_sz + off) * nkv + kvh) * (hd / 2) + (d / 2);
+            k_pool[dst] = f32_to_f16(y) | (f32_to_f16(y_pair) << 16);
+            v_pool[dst] = f32_to_f16(vv) | (f32_to_f16(v_pair) << 16);
+        }
+    }
+}
+
+/// Paged FP16-packed causal attention over `k_pool` / `v_pool` via `page_table`.
+/// HD must be 256 (32 keys x 8 lanes per tile).
+#[cube(launch)]
+pub fn attention_paged(
+    q: &[f32],
+    qg: &[f32],
+    k_pool: &[V4u],
+    v_pool: &[u32],
+    page_table: &[u32],
+    out: &mut [f32],
+    ml: &mut [f32],
+    nh: u32,
+    nkv: u32,
+    pos0: u32,
+    page_size: u32,
+    split_len: u32,
+    scale: f32,
+    #[comptime] hd: usize,
+    #[comptime] partial: bool,
+) {
+    let mut qs = Shared::<[f32]>::new_slice(hd);
+    let mut sc = Shared::<[f32]>::new_slice(32usize);
+    let mut tile_pages = Shared::<[u32]>::new_slice(32usize);
+    let mut tile_offs = Shared::<[u32]>::new_slice(32usize);
+    let h = CUBE_POS_X as usize;
+    let t = CUBE_POS_Y as usize;
+    let split = CUBE_POS_Z as usize;
+    let nsplit = CUBE_COUNT_Z as usize;
+    let d = UNIT_POS as usize;
+    let nh = nh as usize;
+    let nkv = nkv as usize;
+    let page_sz = page_size as usize;
+    let kvh = h / (nh / nkv);
+    qs[d] = q[(t * nh + h) * hd + d] * scale;
+    sync_cube();
+    let nkeys = pos0 as usize + t + 1;
+    let begin = split * split_len as usize;
+    let end = min(nkeys, begin + split_len as usize);
+    let kk = d / 8;
+    let part = d % 8;
+    let span = hd / 8;
+    let d_word = d / 2;
+    let d_shift = ((d % 2) * 16) as u32;
+    let mut m = f32::new(-1.0e30);
+    let mut l = 0.0f32;
+    let mut acc = 0.0f32;
+    let mut s0 = begin;
+    while s0 < end {
+        let s = s0 + kk;
+        let mut partial_dot = 0.0f32;
+        if s < end {
+            let page = page_table[s / page_sz] as usize;
+            let off = s % page_sz;
+            if part == 0 {
+                tile_pages[kk] = page as u32;
+                tile_offs[kk] = off as u32;
+            }
+            let kb = (((page * page_sz + off) * nkv + kvh) * (hd / 2) + part * (span / 2)) / 4;
+            #[unroll]
+            for i in 0..comptime!(hd / 64) {
+                let kv = k_pool[kb + i];
+                #[unroll]
+                for j in 0..4usize {
+                    let w = kv.extract(j);
+                    let k0 = f16_to_f32(w & 0xFFFF);
+                    let k1 = f16_to_f32(w >> 16);
+                    partial_dot += qs[part * span + i * 8 + j * 2] * k0
+                        + qs[part * span + i * 8 + j * 2 + 1] * k1;
+                }
+            }
+        }
+        partial_dot += plane_shuffle_xor(partial_dot, 1);
+        partial_dot += plane_shuffle_xor(partial_dot, 2);
+        partial_dot += plane_shuffle_xor(partial_dot, 4);
+        if part == 0 {
+            sc[kk] = select(s < end, partial_dot, f32::new(-1.0e30));
+        }
+        sync_cube();
+        let mut tmax = m;
+        #[unroll]
+        for i in 0..32usize {
+            tmax = max(tmax, sc[i]);
+        }
+        let corr = f32::exp(m - tmax);
+        l *= corr;
+        acc *= corr;
+        let cnt = min(32usize, end - s0);
+        for i in 0..cnt {
+            let pe = f32::exp(sc[i] - tmax);
+            l += pe;
+            let page = tile_pages[i] as usize;
+            let off = tile_offs[i] as usize;
+            let vw = v_pool[((page * page_sz + off) * nkv + kvh) * (hd / 2) + d_word];
+            acc += pe * f16_to_f32((vw >> d_shift) & 0xFFFF);
+        }
+        m = tmax;
+        sync_cube();
+        s0 += 32;
+    }
+    if comptime!(partial) {
+        let r = (t * nh + h) * nsplit + split;
+        out[r * hd + d] = acc;
+        if d == 0 {
+            ml[r * 2] = m;
+            ml[r * 2 + 1] = l;
+        }
+    } else {
+        let gate = qg[(t * nh + h) * 2 * hd + hd + d];
+        out[(t * nh + h) * hd + d] = acc / l * sigmoid(gate);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mixture of experts
 // ---------------------------------------------------------------------------
@@ -1296,12 +1503,63 @@ pub fn moe_gate_up(
     }
     if row < inter {
         let wrow = slot * inter + row;
-        row_dot(
-            g0, g0v, g1, &lut, xv, wrow, k, &xrow, cnt, &mut ga, fmt, maxm,
-        );
-        row_dot(
-            u0, u0v, u1, &lut, xv, wrow, k, &xrow, cnt, &mut ua, fmt, maxm,
-        );
+        if comptime!(fmt == 2) {
+            // Fused gate+up MXFP4: 4x unrolled word loads sharing xv loads and scale decoding.
+            let lane = UNIT_POS_PLANE as usize;
+            let nl = PLANE_DIM as usize;
+            let words = (k / 32) * 4;
+            let base = wrow * words;
+            let mut w0_idx = lane;
+            while w0_idx < words {
+                #[unroll]
+                for r in 0..4usize {
+                    let u = w0_idx + r * nl;
+                    if u < words {
+                        let wi = base + u;
+                        let b = wi / 4;
+                        let eg = (g1[b / 4] >> (((b % 4) * 8) as u32)) & 0xFF;
+                        let dg =
+                            select(eg < 2, 0.0f32, f32::reinterpret((max(eg, 1u32) - 1) << 23));
+                        let gw = g0[wi];
+                        let eu = (u1[b / 4] >> (((b % 4) * 8) as u32)) & 0xFF;
+                        let du =
+                            select(eu < 2, 0.0f32, f32::reinterpret((max(eu, 1u32) - 1) << 23));
+                        let uw = u0[wi];
+                        let xo = (u / 4) * 8 + u % 4;
+                        #[unroll]
+                        for mi in 0..maxm {
+                            if mi < cnt {
+                                let xl = xv[xrow[mi] + xo];
+                                let xh = xv[xrow[mi] + xo + 4];
+                                let mut sg = 0.0f32;
+                                let mut su = 0.0f32;
+                                #[unroll]
+                                for j in 0..4usize {
+                                    let gb = (gw >> comptime!((j * 8) as u32)) & 0xFF;
+                                    let ub = (uw >> comptime!((j * 8) as u32)) & 0xFF;
+                                    let xlv = xl.extract(j);
+                                    let xhv = xh.extract(j);
+                                    sg += lut[(gb & 0xF) as usize] * xlv
+                                        + lut[(gb >> 4) as usize] * xhv;
+                                    su += lut[(ub & 0xF) as usize] * xlv
+                                        + lut[(ub >> 4) as usize] * xhv;
+                                }
+                                ga[mi] += dg * sg;
+                                ua[mi] += du * su;
+                            }
+                        }
+                    }
+                }
+                w0_idx += 4 * nl;
+            }
+        } else {
+            row_dot(
+                g0, g0v, g1, &lut, xv, wrow, k, &xrow, cnt, &mut ga, fmt, maxm,
+            );
+            row_dot(
+                u0, u0v, u1, &lut, xv, wrow, k, &xrow, cnt, &mut ua, fmt, maxm,
+            );
+        }
     }
     #[unroll]
     for mi in 0..maxm {
@@ -1416,5 +1674,87 @@ pub fn moe_combine(
         }
         let sg = sigmoid(logits[t * stride as usize + gate_col as usize]);
         x[i] += s + sg * shared[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Argmax over [rows, n]
+// ---------------------------------------------------------------------------
+
+#[cube(launch)]
+pub fn argmax_stage1(
+    x: &[f32],
+    part_v: &mut [f32],
+    part_i: &mut [u32],
+    n: u32,
+    #[comptime] nsplit: usize,
+) {
+    let mut sv = Shared::<[f32]>::new_slice(256usize);
+    let mut si = Shared::<[u32]>::new_slice(256usize);
+    let split = CUBE_POS_X as usize;
+    let row = CUBE_POS_Y as usize;
+    let tid = UNIT_POS as usize;
+    let n_u = n as usize;
+    let row_base = row * n_u;
+    let step = nsplit * 256;
+    let mut bv = f32::new(-1.0e38);
+    let mut bi = 0u32;
+    let mut i = split * 256 + tid;
+    while i < n_u {
+        let v = x[row_base + i];
+        if v > bv {
+            bv = v;
+            bi = i as u32;
+        }
+        i += step;
+    }
+    sv[tid] = bv;
+    si[tid] = bi;
+    sync_cube();
+    #[unroll]
+    for s in 0..8usize {
+        let stride = comptime!(128usize >> s);
+        if tid < stride {
+            let ov = sv[tid + stride];
+            let oi = si[tid + stride];
+            if ov > sv[tid] || (ov == sv[tid] && oi < si[tid]) {
+                sv[tid] = ov;
+                si[tid] = oi;
+            }
+        }
+        sync_cube();
+    }
+    if tid == 0 {
+        let o = row * nsplit + split;
+        part_v[o] = sv[0];
+        part_i[o] = si[0];
+    }
+}
+
+#[cube(launch)]
+pub fn argmax_stage2(part_v: &[f32], part_i: &[u32], out: &mut [u32], #[comptime] nsplit: usize) {
+    let mut sv = Shared::<[f32]>::new_slice(nsplit);
+    let mut si = Shared::<[u32]>::new_slice(nsplit);
+    let row = CUBE_POS_X as usize;
+    let tid = UNIT_POS as usize;
+    let o = row * nsplit + tid;
+    sv[tid] = part_v[o];
+    si[tid] = part_i[o];
+    sync_cube();
+    #[unroll]
+    for s in 0..6usize {
+        let stride = comptime!((nsplit / 2) >> s);
+        if tid < stride {
+            let ov = sv[tid + stride];
+            let oi = si[tid + stride];
+            if ov > sv[tid] || (ov == sv[tid] && oi < si[tid]) {
+                sv[tid] = ov;
+                si[tid] = oi;
+            }
+        }
+        sync_cube();
+    }
+    if tid == 0 {
+        out[row] = si[0];
     }
 }

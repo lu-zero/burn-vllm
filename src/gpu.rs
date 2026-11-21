@@ -485,7 +485,7 @@ impl Gpu {
                 k_cache.argv(),
                 v_cache.arg(),
                 out.arg(),
-                self.alloc(1).arg(),
+                self.dummy.arg(),
                 nh as u32,
                 nkv as u32,
                 pos0 as u32,
@@ -511,6 +511,151 @@ impl Gpu {
             nh as u32,
             nkv as u32,
             pos0 as u32,
+            split_len as u32,
+            scale,
+            hd,
+            true,
+        );
+        kernels::attention_combine::launch(
+            &self.client,
+            CubeCount::Static(nh as u32, t as u32, 1),
+            CubeDim::new_1d(hd as u32),
+            parts.arg(),
+            ml.arg(),
+            qg.arg(),
+            out.arg(),
+            nh as u32,
+            nsplit as u32,
+            hd,
+        );
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prep_paged(
+        &self,
+        qg: &Buf,
+        k: &Buf,
+        v: &Buf,
+        q_norm: &Buf,
+        k_norm: &Buf,
+        k_pool: &Buf,
+        v_pool: &Buf,
+        page_table: &Buf,
+        t: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos0: usize,
+        page_size: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Buf {
+        let q = self.alloc(t * nh * hd);
+        kernels::attn_prep_paged::launch(
+            &self.client,
+            CubeCount::Static((nh + nkv) as u32, t as u32, 1),
+            CubeDim::new_1d(hd as u32),
+            qg.arg(),
+            k.arg(),
+            v.arg(),
+            q_norm.arg(),
+            k_norm.arg(),
+            q.arg(),
+            k_pool.arg(),
+            v_pool.arg(),
+            page_table.arg(),
+            nh as u32,
+            nkv as u32,
+            pos0 as u32,
+            page_size as u32,
+            rope_dim as u32,
+            theta,
+            eps,
+            hd,
+        );
+        q
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged(
+        &self,
+        q: &Buf,
+        qg: &Buf,
+        k_pool: &Buf,
+        v_pool: &Buf,
+        page_table: &Buf,
+        t: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos0: usize,
+        page_size: usize,
+    ) -> Buf {
+        assert_eq!(
+            hd, 256,
+            "attention kernel assumes 32 keys x 8 lanes per tile"
+        );
+        let out = self.alloc(t * nh * hd);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let nkeys = pos0 + t;
+        let target_cubes = 256usize;
+        let want_splits = if t <= 8 && nkeys >= 1024 {
+            (target_cubes / (nh * t)).clamp(1, 32)
+        } else {
+            1
+        };
+        let split_len = if want_splits > 1 {
+            (nkeys.div_ceil(want_splits).div_ceil(32) * 32).max(256)
+        } else {
+            nkeys.max(1)
+        };
+        let nsplit = if want_splits > 1 {
+            nkeys.div_ceil(split_len)
+        } else {
+            1
+        };
+        if nsplit <= 1 {
+            kernels::attention_paged::launch(
+                &self.client,
+                CubeCount::Static(nh as u32, t as u32, 1),
+                CubeDim::new_1d(hd as u32),
+                q.arg(),
+                qg.arg(),
+                k_pool.argv(),
+                v_pool.arg(),
+                page_table.arg(),
+                out.arg(),
+                self.dummy.arg(),
+                nh as u32,
+                nkv as u32,
+                pos0 as u32,
+                page_size as u32,
+                nkeys as u32,
+                scale,
+                hd,
+                false,
+            );
+            return out;
+        }
+        let parts = self.alloc(t * nh * nsplit * hd);
+        let ml = self.alloc(t * nh * nsplit * 2);
+        kernels::attention_paged::launch(
+            &self.client,
+            CubeCount::Static(nh as u32, t as u32, nsplit as u32),
+            CubeDim::new_1d(hd as u32),
+            q.arg(),
+            qg.arg(),
+            k_pool.argv(),
+            v_pool.arg(),
+            page_table.arg(),
+            parts.arg(),
+            ml.arg(),
+            nh as u32,
+            nkv as u32,
+            pos0 as u32,
+            page_size as u32,
             split_len as u32,
             scale,
             hd,
@@ -710,6 +855,33 @@ impl Gpu {
         );
     }
 
+    /// Argmax along the last dimension for `[rows, n]` logits; returns `rows` token ids.
+    pub fn argmax_rows(&self, logits: &Buf, rows: usize, n: usize) -> Vec<u32> {
+        const NSPLIT: usize = 64;
+        let part_v = self.alloc(rows * NSPLIT);
+        let part_i = self.alloc(rows * NSPLIT);
+        let out = self.alloc(rows);
+        kernels::argmax_stage1::launch(
+            &self.client,
+            CubeCount::Static(NSPLIT as u32, rows as u32, 1),
+            CubeDim::new_1d(WG),
+            logits.arg(),
+            part_v.arg(),
+            part_i.arg(),
+            n as u32,
+            NSPLIT,
+        );
+        kernels::argmax_stage2::launch(
+            &self.client,
+            CubeCount::Static(rows as u32, 1, 1),
+            CubeDim::new_1d(NSPLIT as u32),
+            part_v.arg(),
+            part_i.arg(),
+            out.arg(),
+            NSPLIT,
+        );
+        self.read_u32(&out)
+    }
     pub fn sync(&self) {
         futures_lite::future::block_on(self.client.sync()).expect("device sync");
     }

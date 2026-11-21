@@ -31,6 +31,10 @@ impl Sampler {
         Self { p, state }
     }
 
+    pub fn is_greedy(&self) -> bool {
+        self.p.temperature <= 0.0 || self.p.top_k == 1
+    }
+
     fn next_f32(&mut self) -> f32 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;

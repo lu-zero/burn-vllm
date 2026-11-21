@@ -5,6 +5,7 @@ mod iq_grids;
 mod kernels;
 mod model;
 mod quant;
+mod radix;
 mod sampler;
 mod selftest;
 mod tokenizer;
@@ -18,7 +19,7 @@ const DEFAULT_MODEL: &str = "/home/theo/.cache/huggingface/hub/models--unsloth--
 const USAGE: &str = "usage: burn-vllm [options] [--prompt TEXT]
   --model PATH          GGUF file (qwen35moe)
   --backend cuda|wgpu   runtime (default: cuda if built, else wgpu)
-  --prompt TEXT         user message (default: a short question)
+  --prompt TEXT         user message (repeatable to test RadixAttention prefix reuse)
   --raw                 feed the prompt verbatim (no chat template)
   --no-think            pre-fill an empty <think></think> block
   -n N                  max new tokens (default 256)
@@ -35,7 +36,7 @@ const USAGE: &str = "usage: burn-vllm [options] [--prompt TEXT]
 struct Args {
     model: PathBuf,
     backend: Option<String>,
-    prompt: String,
+    prompts: Vec<String>,
     raw: bool,
     think: bool,
     n: usize,
@@ -53,7 +54,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         model: PathBuf::from(DEFAULT_MODEL),
         backend: None,
-        prompt: "Explain in two sentences why the sky is blue.".into(),
+        prompts: Vec::new(),
         raw: false,
         think: true,
         n: 256,
@@ -72,7 +73,7 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--model" => a.model = val()?.into(),
             "--backend" => a.backend = Some(val()?),
-            "--prompt" | "-p" => a.prompt = val()?,
+            "--prompt" | "-p" => a.prompts.push(val()?),
             "--raw" => a.raw = true,
             "--no-think" => a.think = false,
             "-n" => a.n = val()?.parse()?,
@@ -93,6 +94,10 @@ fn parse_args() -> Result<Args> {
             }
             other => bail!("unknown argument {other}\n{USAGE}"),
         }
+    }
+    if a.prompts.is_empty() {
+        a.prompts
+            .push("Explain in two sentences why the sky is blue.".into());
     }
     Ok(a)
 }
@@ -140,148 +145,177 @@ fn main() -> Result<()> {
         spec_k: args.mtp,
     };
     let mut model = model::Model::load(gpu, gguf, &opts)?;
-
-    let text = if args.raw {
-        args.prompt.clone()
-    } else {
-        let think = if args.think {
-            "<think>\n"
-        } else {
-            "<think>\n\n</think>\n\n"
-        };
-        format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{think}",
-            args.prompt
-        )
-    };
-    let prompt = tok.encode(&text)?;
     let stop: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
         .iter()
         .filter_map(|s| tok.token_id(s))
         .chain([tok.eos])
         .collect();
-    eprintln!("prompt: {} tokens", prompt.len());
-
     let spec_k = if model.has_mtp() { args.mtp } else { 0 };
     if args.mtp > 0 && !model.has_mtp() {
         eprintln!("warning: --mtp needs a GGUF with an MTP (nextn) block; ignoring");
     }
-    let mut st = model.new_state(args.ctx, spec_k);
-    let mut sampler = sampler::Sampler::new(args.sampling.clone());
-    let t0 = Instant::now();
-    let mut logits = Vec::new();
-    let mut h_prev = None;
-    if spec_k > 0 {
-        let (l, h) = model.prefill_spec(&prompt, args.chunk, &mut st)?;
-        logits = l;
-        h_prev = Some(h);
-    } else {
-        for chunk in prompt.chunks(args.chunk.max(1)) {
-            logits = model.forward(chunk, &mut st)?;
-        }
-    }
-    let prefill = t0.elapsed().as_secs_f64();
-    let stats0 = model.stats.clone();
-    if let Some(p) = model.prof.summary() {
-        eprintln!("after prefill: {p}");
-    }
 
-    print!("{text}");
-    let mut out_bytes = Vec::new();
-    let mut printed = 0;
-    let t1 = Instant::now();
-    let mut generated = 0;
-    // Emits one token; returns true when it is a stop token (not emitted).
-    let mut emit = |next: u32| -> Result<bool> {
-        if stop.contains(&next) {
-            return Ok(true);
-        }
-        generated += 1;
-        out_bytes.extend(tok.token_bytes(next));
-        // Print the longest valid UTF-8 prefix not yet printed.
-        let valid = match std::str::from_utf8(&out_bytes[printed..]) {
-            Ok(s) => s.len(),
-            Err(e) => e.valid_up_to(),
+    for (pi, raw_prompt) in args.prompts.iter().enumerate() {
+        let text = if args.raw {
+            raw_prompt.clone()
+        } else {
+            let think = if args.think {
+                "<think>\n"
+            } else {
+                "<think>\n\n</think>\n\n"
+            };
+            format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{think}",
+                raw_prompt
+            )
         };
-        print!(
-            "{}",
-            std::str::from_utf8(&out_bytes[printed..printed + valid]).unwrap()
-        );
-        std::io::stdout().flush()?;
-        printed += valid;
-        Ok(false)
-    };
-    let (mut cycles, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
-    if spec_k > 0 {
-        let mut pending = sampler.sample(&logits);
-        let mut emitted = 0usize;
-        while emitted < args.n {
-            if emit(pending)? {
-                break;
+        let prompt = tok.encode(&text)?;
+        if args.prompts.len() > 1 {
+            eprintln!("--- prompt {}: {} tokens ---", pi + 1, prompt.len());
+        } else {
+            eprintln!("prompt: {} tokens", prompt.len());
+        }
+
+        let mut st = model.new_state(args.ctx, spec_k);
+        let mut sampler = sampler::Sampler::new(args.sampling.clone());
+        let stats_before = model.stats.clone();
+        let t0 = Instant::now();
+        let mut logits;
+        let mut h_prev = None;
+        let radix_hit;
+        if spec_k > 0 {
+            let (l, h, hit) = model.prefill_spec(&prompt, args.chunk, &mut st)?;
+            logits = l;
+            h_prev = Some(h);
+            radix_hit = hit;
+        } else {
+            let (l, hit) = model.prefill_radix(&prompt, args.chunk, &mut st)?;
+            logits = l;
+            radix_hit = hit;
+        }
+        let prefill = t0.elapsed().as_secs_f64();
+        let stats0 = model.stats.clone();
+        if radix_hit > 0 {
+            eprintln!(
+                "radix cache hit: {radix_hit}/{} prompt tokens",
+                prompt.len()
+            );
+        }
+        if let Some(p) = model.prof.summary() {
+            eprintln!("after prefill: {p}");
+        }
+
+        print!("{text}");
+        let mut out_bytes = Vec::new();
+        let mut printed = 0;
+        let t1 = Instant::now();
+        let mut generated = 0;
+        // Emits one token; returns true when it is a stop token (not emitted).
+        let mut emit = |next: u32| -> Result<bool> {
+            if stop.contains(&next) {
+                return Ok(true);
             }
-            emitted += 1;
-            if emitted >= args.n || st.pos + spec_k + 1 >= args.ctx {
-                break;
-            }
-            let out = model.spec_step(
-                &mut st,
-                pending,
-                h_prev.as_ref().unwrap(),
-                spec_k,
-                &mut sampler,
-            )?;
-            cycles += 1;
-            drafted += out.drafted;
-            accepted += out.accepted.len();
-            let mut stopped = false;
-            for d in out.accepted {
-                if emitted >= args.n || emit(d)? {
-                    stopped = true;
+            generated += 1;
+            out_bytes.extend(tok.token_bytes(next));
+            let valid = match std::str::from_utf8(&out_bytes[printed..]) {
+                Ok(s) => s.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            print!(
+                "{}",
+                std::str::from_utf8(&out_bytes[printed..printed + valid]).unwrap()
+            );
+            std::io::stdout().flush()?;
+            printed += valid;
+            Ok(false)
+        };
+        let (mut cycles, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+        if spec_k > 0 {
+            let mut pending = sampler.sample(&logits);
+            let mut emitted = 0usize;
+            while emitted < args.n {
+                if emit(pending)? {
                     break;
                 }
                 emitted += 1;
+                if emitted >= args.n || st.pos + spec_k + 1 >= args.ctx {
+                    break;
+                }
+                let out = model.spec_step(
+                    &mut st,
+                    pending,
+                    h_prev.as_ref().unwrap(),
+                    spec_k,
+                    &mut sampler,
+                )?;
+                cycles += 1;
+                drafted += out.drafted;
+                accepted += out.accepted.len();
+                let mut stopped = false;
+                for d in out.accepted {
+                    if emitted >= args.n || emit(d)? {
+                        stopped = true;
+                        break;
+                    }
+                    emitted += 1;
+                }
+                if stopped {
+                    break;
+                }
+                pending = out.next;
+                h_prev = Some(out.hidden);
             }
-            if stopped {
-                break;
+        } else if sampler.is_greedy() {
+            let mut next = sampler.sample(&logits);
+            for _ in 0..args.n {
+                if emit(next)? || st.pos >= args.ctx {
+                    break;
+                }
+                next = model.forward_greedy(&[next], &mut st)?;
             }
-            pending = out.next;
-            h_prev = Some(out.hidden);
+        } else {
+            for _ in 0..args.n {
+                let next = sampler.sample(&logits);
+                if emit(next)? || st.pos >= args.ctx {
+                    break;
+                }
+                logits = model.forward(&[next], &mut st)?;
+            }
         }
-    } else {
-        for _ in 0..args.n {
-            let next = sampler.sample(&logits);
-            if emit(next)? || st.pos >= args.ctx {
-                break;
-            }
-            logits = model.forward(&[next], &mut st)?;
+        drop(emit);
+        if spec_k > 0 {
+            eprintln!(
+                "spec: {cycles} steps, {accepted}/{drafted} drafts accepted ({:.2} tokens/step)",
+                (accepted + cycles) as f64 / cycles.max(1) as f64
+            );
         }
-    }
-    drop(emit);
-    if spec_k > 0 {
+        println!();
+        let decode = t1.elapsed().as_secs_f64();
+        let s = &model.stats;
+        let computed_prefill = prompt.len() - radix_hit;
         eprintln!(
-            "spec: {cycles} steps, {accepted}/{drafted} drafts accepted ({:.2} tokens/step)",
-            (accepted + cycles) as f64 / cycles.max(1) as f64
+            "prefill: {} tok ({} computed) in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s)",
+            prompt.len(),
+            computed_prefill,
+            prefill,
+            prompt.len() as f64 / prefill,
+            generated,
+            decode,
+            generated as f64 / decode,
         );
-    }
-    println!();
-    let decode = t1.elapsed().as_secs_f64();
-    let s = &model.stats;
-    eprintln!(
-        "prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: {} tok in {:.2}s ({:.2} tok/s)",
-        prompt.len(),
-        prefill,
-        prompt.len() as f64 / prefill,
-        generated,
-        decode,
-        generated as f64 / decode,
-    );
-    for (phase, st) in [("prefill", stats0.clone()), ("decode", s.since(&stats0))] {
-        if let Some(line) = st.summary() {
-            eprintln!("{phase} experts: {line}");
+        for (phase, st_diff) in [
+            ("prefill", stats0.since(&stats_before)),
+            ("decode", s.since(&stats0)),
+        ] {
+            if let Some(line) = st_diff.summary() {
+                eprintln!("{phase} experts: {line}");
+            }
         }
-    }
-    if let Some(p) = model.prof.summary() {
-        eprintln!("{p}");
+        if let Some(p) = model.prof.summary() {
+            eprintln!("{p}");
+        }
+        model.cache_sequence(&st);
+        model.release_state(st);
     }
     Ok(())
 }

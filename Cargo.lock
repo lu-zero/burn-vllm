@@ -617,6 +617,7 @@ dependencies = [
  "half",
  "memmap2",
  "rayon",
+ "winnow-args",
 ]
 
 [[package]]
@@ -5729,6 +5730,30 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow-args"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb5cb32dfd90d16799dd187382c9a988ff289c45351d3ab113848d364115eef3"
+dependencies = [
+ "winnow",
+ "winnow-args-derive",
+]
+
+[[package]]
+name = "winnow-args-derive"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "159245d7b81a34ea973fc6acebb16ac9c7d1a867273518af2dfa7c70e9124773"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "wit-bindgen"

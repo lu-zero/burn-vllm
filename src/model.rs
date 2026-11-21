@@ -56,8 +56,10 @@ use crate::gguf::{Gguf, TensorInfo};
 use crate::gpu::{Buf, Gpu, QWeight};
 use crate::kernels::{MOE_DESC, MOE_MAXM};
 use crate::quant::{self, fmt};
+use crate::radix::{GdnCheckpoint, KV_PAGE_SIZE, KvPool, RadixTree};
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -353,6 +355,9 @@ pub struct Model {
     out_norm: Buf,
     lm_head: QWeight,
     embd: TensorInfo,
+    pub kv_pool: KvPool,
+    pub radix: RadixTree,
+    attn_idx: Vec<Option<usize>>,
     /// Rows at or above which dense layers dequantize + use the tiled GEMM.
     pub gemm_min_m: usize,
     clock: u64,
@@ -451,11 +456,15 @@ pub struct FwdOpts {
     pub keep_hidden: bool,
     /// Save per-token GDN snapshots so a verify window can be rolled back.
     pub snap: bool,
+    /// Return GPU-computed argmax token IDs instead of reading full logits back to host.
+    pub greedy: bool,
 }
 
 pub struct FwdOut {
-    /// `rows * vocab` logits.
+    /// `rows * vocab` logits (empty when `FwdOpts::greedy` is set).
     pub logits: Vec<f32>,
+    /// `rows` argmax token IDs (populated when `FwdOpts::greedy` is set).
+    pub tokens: Vec<u32>,
     /// `[t, hidden]` out-normed hidden states, when requested.
     pub hidden: Option<Buf>,
 }
@@ -465,11 +474,11 @@ mod mtp;
 pub struct State {
     pub pos: usize,
     max_ctx: usize,
-    kv: Vec<Option<(Buf, Buf)>>,
+    pub page_table: Vec<u32>,
+    page_table_buf: Buf,
+    pub tokens: Vec<u32>,
     conv: Vec<Option<Buf>>,
     ssm: Vec<Option<Buf>>,
-    /// MTP block's own KV cache.
-    mtp_kv: Option<(Buf, Buf)>,
     /// Per-GDN-layer snapshots of the recurrent / conv state after each token of a
     /// verify window but the last ([spec_k, ...]), for rollback on rejection.
     ssm_snap: Vec<Option<Buf>>,
@@ -527,16 +536,21 @@ impl Model {
         } else {
             0
         };
-        let kv_bytes = (cfg.n_layers / cfg.full_attn_interval + cfg.n_mtp)
-            * 2
-            * opts.max_ctx
-            * cfg.n_kv
-            * cfg.head_dim
-            * 4;
+        let num_pages = opts.max_ctx.div_ceil(KV_PAGE_SIZE);
+        let n_attn_layers = cfg.n_layers / cfg.full_attn_interval + cfg.n_mtp;
+        let kv_bytes =
+            n_attn_layers * 2 * num_pages * KV_PAGE_SIZE * cfg.n_kv * (cfg.head_dim / 2) * 4;
+        let is_wgpu = gpu.client.name().starts_with("wgpu");
         let total_vram = opts
             .vram_budget
             .or(gpu.client.properties().memory.max_memory())
             .unwrap_or(8 << 30) as usize;
+        // wgpu reports raw physical VRAM and allocates staging/driver buffers out of it.
+        let effective_vram = if opts.vram_budget.is_none() && is_wgpu {
+            (total_vram as f64 * 0.80) as usize
+        } else {
+            total_vram
+        };
         // GPU layouts carry a little padding; scratch for a 512-token prefill chunk.
         // Speculative decoding keeps per-token GDN state snapshots for rollback.
         let gdn_layers = cfg.n_layers - cfg.n_layers / cfg.full_attn_interval;
@@ -551,7 +565,7 @@ impl Model {
             match opts.expert_slots {
                 Some(s) => s.clamp(cfg.topk, cfg.n_experts),
                 None => {
-                    let avail = total_vram.saturating_sub(reserve);
+                    let avail = effective_vram.saturating_sub(reserve);
                     let per_slot = (expert_bytes_per as f64 * 1.08) as usize * cfg.n_layers;
                     (avail / per_slot).clamp(cfg.topk, cfg.n_experts)
                 }
@@ -674,6 +688,19 @@ impl Model {
                     ))
                 })?;
         let embd = g.tensor("token_embd.weight")?.clone();
+        let mut attn_idx = Vec::with_capacity(cfg.n_layers + cfg.n_mtp);
+        let mut next_ai = 0usize;
+        for i in 0..cfg.n_layers + cfg.n_mtp {
+            let is_mtp = i >= cfg.n_layers;
+            if cfg.is_full_attn(i) || is_mtp {
+                attn_idx.push(Some(next_ai));
+                next_ai += 1;
+            } else {
+                attn_idx.push(None);
+            }
+        }
+        let kv_pool = KvPool::new(&gpu, n_attn_layers, num_pages, cfg.n_kv, cfg.head_dim);
+        let radix = RadixTree::new(8);
         let mut model = Self {
             cfg,
             gpu,
@@ -685,6 +712,9 @@ impl Model {
             out_norm,
             lm_head,
             embd,
+            kv_pool,
+            radix,
+            attn_idx,
             // Measured crossover (`--bench`, RTX 5050): qmatmul is ~18 us per token on
             // 8192x2048 Q8_0, dequant + GEMM ~1.3 ms flat.
             gemm_min_m: 80,
@@ -692,7 +722,6 @@ impl Model {
             stats: Stats::default(),
             prof: Prof::new(),
         };
-        // Fill every slot up front: resident mode loads all experts, cache mode warms up
         // with the first experts.
         for li in 0..model.moes.len() {
             let store = &mut model.moes[li].experts;
@@ -712,26 +741,25 @@ impl Model {
 
     pub fn new_state(&self, max_ctx: usize, spec_k: usize) -> State {
         let c = &self.cfg;
+        let max_pages = max_ctx.div_ceil(KV_PAGE_SIZE).max(1);
         let mut st = State {
             pos: 0,
             max_ctx,
-            kv: vec![],
+            page_table: Vec::new(),
+            page_table_buf: self.gpu.zeros(max_pages),
+            tokens: Vec::new(),
             conv: vec![],
             ssm: vec![],
-            mtp_kv: None,
             ssm_snap: vec![],
             conv_snap: vec![],
         };
         for i in 0..c.n_layers {
             if c.is_full_attn(i) {
-                let n = max_ctx * c.n_kv * c.head_dim;
-                st.kv.push(Some((self.gpu.zeros(n), self.gpu.zeros(n))));
                 st.conv.push(None);
                 st.ssm.push(None);
                 st.conv_snap.push(None);
                 st.ssm_snap.push(None);
             } else {
-                st.kv.push(None);
                 st.conv
                     .push(Some(self.gpu.zeros((c.conv_k - 1) * c.conv_dim())));
                 st.ssm
@@ -748,11 +776,150 @@ impl Model {
                 }
             }
         }
-        if self.mtp.is_some() {
-            let n = max_ctx * c.n_kv * c.head_dim;
-            st.mtp_kv = Some((self.gpu.zeros(n), self.gpu.zeros(n)));
-        }
         st
+    }
+
+    /// Ensure physical KV pages are allocated and synced to GPU for `target_tokens`.
+    pub fn ensure_pages(&mut self, st: &mut State, target_tokens: usize) -> Result<()> {
+        let need = target_tokens.div_ceil(KV_PAGE_SIZE);
+        let start = st.page_table.len();
+        if need <= start {
+            return Ok(());
+        }
+        let mut added = Vec::with_capacity(need - start);
+        for _ in start..need {
+            let p = self
+                .kv_pool
+                .alloc_page(&mut self.radix)
+                .context("paged KV pool exhausted")?;
+            st.page_table.push(p);
+            added.push(p);
+        }
+        self.gpu.write_at(&st.page_table_buf, start, added);
+        Ok(())
+    }
+
+    /// Unpin all KV pages held by `st` (pages saved in `self.radix` remain cached until evicted).
+    pub fn release_state(&mut self, st: State) {
+        for p in st.page_table {
+            self.kv_pool.unpin(p);
+        }
+    }
+
+    fn has_gdn(&self) -> bool {
+        self.cfg.n_layers > self.cfg.n_layers / self.cfg.full_attn_interval
+    }
+
+    fn save_gdn_checkpoint(&self, st: &State, last_hidden: Option<&Buf>) -> GdnCheckpoint {
+        let conv = st
+            .conv
+            .iter()
+            .map(|b| b.as_ref().map(|buf| self.gpu.read_f32(buf)))
+            .collect();
+        let ssm = st
+            .ssm
+            .iter()
+            .map(|b| b.as_ref().map(|buf| self.gpu.read_f32(buf)))
+            .collect();
+        let last_hidden = last_hidden.map(|buf| self.gpu.read_f32(buf));
+        GdnCheckpoint {
+            conv,
+            ssm,
+            last_hidden,
+        }
+    }
+
+    fn restore_gdn_checkpoint(&self, st: &State, ckpt: &GdnCheckpoint) {
+        let mut writes = Vec::new();
+        for (dst, src) in st.conv.iter().zip(&ckpt.conv) {
+            if let (Some(d), Some(s)) = (dst, src) {
+                let words: Vec<u32> = bytemuck::cast_slice::<f32, u32>(s).to_vec();
+                writes.push((d, 0usize, words));
+            }
+        }
+        for (dst, src) in st.ssm.iter().zip(&ckpt.ssm) {
+            if let (Some(d), Some(s)) = (dst, src) {
+                let words: Vec<u32> = bytemuck::cast_slice::<f32, u32>(s).to_vec();
+                writes.push((d, 0usize, words));
+            }
+        }
+        self.gpu.write_many(writes);
+    }
+
+    /// Cache the `KV_PAGE_SIZE`-aligned prefix of `st` in the RadixTree (without GDN
+    /// checkpoint if `st.pos` is not at the checkpointed position, or with GDN checkpoint
+    /// if `st.pos % KV_PAGE_SIZE == 0`).
+    pub fn cache_sequence(&mut self, st: &State) {
+        let aligned = (st.pos / KV_PAGE_SIZE) * KV_PAGE_SIZE;
+        if aligned == 0 || st.tokens.len() < aligned {
+            return;
+        }
+        let nblocks = aligned / KV_PAGE_SIZE;
+        let ckpt = (st.pos == aligned).then(|| Arc::new(self.save_gdn_checkpoint(st, None)));
+        self.radix.insert_prefix(
+            &st.tokens[..aligned],
+            &st.page_table[..nblocks],
+            ckpt,
+            &mut self.kv_pool,
+        );
+    }
+
+    /// Prefill `prompt` using RadixAttention prefix matching + chunked prefill.
+    /// Returns `(last_token_logits, matched_prefix_tokens)`.
+    pub fn prefill_radix(
+        &mut self,
+        prompt: &[u32],
+        chunk: usize,
+        st: &mut State,
+    ) -> Result<(Vec<f32>, usize)> {
+        ensure!(!prompt.is_empty(), "empty prompt");
+        let require_gdn = self.has_gdn();
+        let m = self
+            .radix
+            .match_prefix(prompt, &mut self.kv_pool, require_gdn, true);
+        let matched = m.matched_tokens;
+        if matched > 0 {
+            st.page_table.extend_from_slice(&m.pages);
+            self.gpu.write_at(&st.page_table_buf, 0, m.pages);
+            if let Some(ckpt) = &m.gdn_ckpt {
+                self.restore_gdn_checkpoint(st, ckpt);
+            }
+            st.pos = matched;
+            st.tokens.extend_from_slice(&prompt[..matched]);
+        }
+        let aligned_end = ((prompt.len() - 1) / KV_PAGE_SIZE) * KV_PAGE_SIZE;
+        let step = (chunk / KV_PAGE_SIZE).max(1) * KV_PAGE_SIZE;
+        let mut logits = Vec::new();
+        if matched == 0 && aligned_end > KV_PAGE_SIZE {
+            logits = self.forward(&prompt[..KV_PAGE_SIZE], st)?;
+            let ckpt = Arc::new(self.save_gdn_checkpoint(st, None));
+            self.radix.insert_prefix(
+                &prompt[..KV_PAGE_SIZE],
+                &st.page_table[..1],
+                Some(ckpt),
+                &mut self.kv_pool,
+            );
+        }
+        let start_pos = st.pos;
+        if start_pos < aligned_end {
+            for ch in prompt[start_pos..aligned_end].chunks(step) {
+                logits = self.forward(ch, st)?;
+                let cur_end = st.pos;
+                let ckpt = Arc::new(self.save_gdn_checkpoint(st, None));
+                let nblocks = cur_end / KV_PAGE_SIZE;
+                self.radix.insert_prefix(
+                    &prompt[..cur_end],
+                    &st.page_table[..nblocks],
+                    Some(ckpt),
+                    &mut self.kv_pool,
+                );
+            }
+        }
+        let tail_start = matched.max(aligned_end);
+        for ch in prompt[tail_start..].chunks(chunk.max(1)) {
+            logits = self.forward(ch, st)?;
+        }
+        Ok((logits, matched))
     }
 
     fn embed(&self, tokens: &[u32]) -> Vec<f32> {
@@ -772,6 +939,19 @@ impl Model {
         Ok(self.forward_ext(tokens, st, FwdOpts::default())?.logits)
     }
 
+    /// Run `tokens` through the model, appending to `state`; returns last-token argmax.
+    pub fn forward_greedy(&mut self, tokens: &[u32], st: &mut State) -> Result<u32> {
+        let out = self.forward_ext(
+            tokens,
+            st,
+            FwdOpts {
+                greedy: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(out.tokens[0])
+    }
+
     /// [`Self::forward`] with optional all-row logits, the normed hidden states of every
     /// row (the MTP head's input) and GDN rollback snapshots.
     pub fn forward_ext(&mut self, tokens: &[u32], st: &mut State, opts: FwdOpts) -> Result<FwdOut> {
@@ -780,6 +960,8 @@ impl Model {
         if st.pos + t > st.max_ctx {
             bail!("context overflow: {} + {} > {}", st.pos, t, st.max_ctx);
         }
+        self.ensure_pages(st, st.pos + t)?;
+        st.tokens.extend_from_slice(tokens);
         let c = self.cfg.clone();
         let gm = self.gemm_min_m;
         let x = self.gpu.upload_f32(&self.embed(tokens));
@@ -853,8 +1035,14 @@ impl Model {
             self.stats.promotions += 1;
         }
         self.prof.tick(&self.gpu, 7);
+        let (logits_out, tokens_out) = if opts.greedy {
+            (Vec::new(), self.gpu.argmax_rows(&logits, rows, c.vocab))
+        } else {
+            (self.gpu.read_f32(&logits), Vec::new())
+        };
         Ok(FwdOut {
-            logits: self.gpu.read_f32(&logits),
+            logits: logits_out,
+            tokens: tokens_out,
             hidden: xn_all,
         })
     }
@@ -929,28 +1117,43 @@ impl Model {
                 gpu.linear_acc(&w.out, &o, t, x, gm);
             }
             Mixer::Attn(w) => {
-                let (kc, vc) = st.kv[li].as_ref().unwrap();
+                let ai = self.attn_idx[li].expect("full-attn layer index");
+                let (kp, vp) = (&self.kv_pool.k_pools[ai], &self.kv_pool.v_pools[ai]);
                 let qg = gpu.linear(&w.q, &h, t, gm);
                 let k = gpu.linear(&w.k, &h, t, gm);
                 let v = gpu.linear(&w.v, &h, t, gm);
-                let q = gpu.attn_prep(
+                let q = gpu.attn_prep_paged(
                     &qg,
                     &k,
                     &v,
                     &w.q_norm,
                     &w.k_norm,
-                    kc,
-                    vc,
+                    kp,
+                    vp,
+                    &st.page_table_buf,
                     t,
                     c.n_heads,
                     c.n_kv,
                     c.head_dim,
                     pos,
+                    KV_PAGE_SIZE,
                     c.rope_dim,
                     c.rope_theta,
                     c.eps,
                 );
-                let o = gpu.attention(&q, &qg, kc, vc, t, c.n_heads, c.n_kv, c.head_dim, pos);
+                let o = gpu.attention_paged(
+                    &q,
+                    &qg,
+                    kp,
+                    vp,
+                    &st.page_table_buf,
+                    t,
+                    c.n_heads,
+                    c.n_kv,
+                    c.head_dim,
+                    pos,
+                    KV_PAGE_SIZE,
+                );
                 gpu.linear_acc(&w.o, &o, t, x, gm);
             }
         }
@@ -1007,24 +1210,54 @@ impl Model {
         ];
         let pos = st.pos;
         let mut routed = [Some(self.mix_route(0, &xs[0], ta, pos, st, snaps[0])), None];
+        let mut ready_promo: Option<(usize, usize, usize, [quant::Packed; 3])> = None;
         for li in 0..n_layers {
             for m in 0..2 {
                 let (h2, r) = routed[m].take().expect("micro-batch routed");
-                let mut job = self.moe_begin(li, &h2, mb[m].1, r, pending);
+                let ts = Instant::now();
+                let pack_host = self.gpu.read_u32(&r.pack);
+                self.stats.route_sync_secs += ts.elapsed().as_secs_f64();
+                if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo.take() {
+                    let tl = Instant::now();
+                    self.moes[prev_li]
+                        .experts
+                        .commit_one(&self.gpu, prev_e, prev_slot, packed);
+                    self.moes[prev_li].experts.stamp[prev_slot] = self.clock;
+                    self.stats.upload_secs += tl.elapsed().as_secs_f64();
+                    self.stats.promotions += 1;
+                }
+                let mut job = self.moe_begin_host(li, &h2, mb[m].1, &pack_host, r, pending);
+                let promo_req = pending.take();
                 let (nli, nm) = if m == 0 { (li, 1) } else { (li + 1, 0) };
                 let this = &*self;
                 let tc = Instant::now();
-                routed[nm] = cpu_moe::overlap(
+                let (next_routed, next_ready) = cpu_moe::overlap(
                     || this.moe_cpu(&mut job),
                     || {
-                        (nli < n_layers).then(|| {
+                        let nr = (nli < n_layers).then(|| {
                             this.mix_route(nli, &xs[nm], mb[nm].1, pos + mb[nm].0, st, snaps[nm])
-                        })
+                        });
+                        let np = promo_req.map(|(p_li, p_e, p_slot)| {
+                            let p = this.moes[p_li].experts.repack_one(&this.gguf, p_e);
+                            (p_li, p_e, p_slot, p)
+                        });
+                        (nr, np)
                     },
                 );
+                ready_promo = next_ready;
                 self.stats.cpu_secs += tc.elapsed().as_secs_f64();
+                routed[nm] = next_routed;
                 self.moe_finish(&xs[m], job);
             }
+        }
+        if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo.take() {
+            let tl = Instant::now();
+            self.moes[prev_li]
+                .experts
+                .commit_one(&self.gpu, prev_e, prev_slot, packed);
+            self.moes[prev_li].experts.stamp[prev_slot] = self.clock;
+            self.stats.upload_secs += tl.elapsed().as_secs_f64();
+            self.stats.promotions += 1;
         }
     }
 
@@ -1045,7 +1278,7 @@ impl Model {
             .unwrap();
         let cur = st.expert_in[victim];
         let cur_f = if cur >= 0 { st.freq[cur as usize] } else { 0 };
-        ((cur_f == 0 && best_f >= 2) || (best_f >= cur_f + 6)).then_some((li, best_e, victim))
+        ((cur_f == 0 && best_f >= 2) || (best_f >= cur_f * 2 + 8)).then_some((li, best_e, victim))
     }
 
     /// Enqueue the router and the packed (ids, weights, h2) readback buffer.
