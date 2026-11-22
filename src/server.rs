@@ -630,19 +630,63 @@ impl Meta {
     }
 }
 
+/// Where a response stream is in its lifecycle. Engine messages are only consumed while
+/// `Open`; once the terminal chunks are queued the stream just drains them and stops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Open,
+    Ending,
+    Finished,
+}
+
 /// Server-sent events for one response, ending with `data: [DONE]`.
 struct Stream {
     rx: tokio_mpsc::UnboundedReceiver<Msg>,
     queue: VecDeque<String>,
     meta: Meta,
     include_usage: bool,
-    ended: bool,
+    phase: StreamPhase,
 }
 
 impl Stream {
-    fn end(&mut self) {
+    /// Queue the terminal chunks, then `[DONE]`, in one place.
+    fn end(&mut self, tail: Vec<String>) {
+        self.queue.extend(tail);
         self.queue.push_back("[DONE]".into());
-        self.ended = true;
+        self.phase = StreamPhase::Ending;
+    }
+
+    /// The next SSE data payload, or `None` once the stream is finished.
+    async fn next(&mut self) -> Option<String> {
+        loop {
+            if let Some(data) = self.queue.pop_front() {
+                return Some(data);
+            }
+            match self.phase {
+                StreamPhase::Finished => return None,
+                StreamPhase::Ending => {
+                    self.phase = StreamPhase::Finished;
+                    return None;
+                }
+                StreamPhase::Open => {}
+            }
+            match self.rx.recv().await {
+                Some(Msg::Piece(p)) => {
+                    self.queue.push_back(self.meta.chunk(Some(&p), Value::Null));
+                }
+                Some(Msg::Done(f)) => {
+                    let mut tail = vec![self.meta.chunk(None, json!(f.reason))];
+                    if self.include_usage {
+                        tail.push(self.meta.usage_chunk(&f));
+                    }
+                    self.end(tail);
+                }
+                Some(Msg::Failed(e)) => {
+                    self.end(vec![json!({"error": {"message": e.message}}).to_string()]);
+                }
+                None => self.end(Vec::new()),
+            }
+        }
     }
 }
 
@@ -656,34 +700,12 @@ fn stream_response(
         queue: VecDeque::new(),
         meta,
         include_usage,
-        ended: false,
+        phase: StreamPhase::Open,
     };
     let events = futures_lite::stream::unfold(state, |mut s| async move {
-        loop {
-            if let Some(data) = s.queue.pop_front() {
-                let event = SseEvent::default().data(data);
-                return Some((Ok::<_, Infallible>(event), s));
-            }
-            if s.ended {
-                return None;
-            }
-            match s.rx.recv().await {
-                Some(Msg::Piece(p)) => s.queue.push_back(s.meta.chunk(Some(&p), Value::Null)),
-                Some(Msg::Done(f)) => {
-                    s.queue.push_back(s.meta.chunk(None, json!(f.reason)));
-                    if s.include_usage {
-                        s.queue.push_back(s.meta.usage_chunk(&f));
-                    }
-                    s.end();
-                }
-                Some(Msg::Failed(e)) => {
-                    s.queue
-                        .push_back(json!({"error": {"message": e.message}}).to_string());
-                    s.end();
-                }
-                None => s.end(),
-            }
-        }
+        s.next()
+            .await
+            .map(|data| (Ok::<_, Infallible>(SseEvent::default().data(data)), s))
     });
     Sse::new(events).into_response()
 }
@@ -806,6 +828,112 @@ pub fn serve(model: Model, tok: Tokenizer, opts: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::block_on;
+
+    fn stream_meta(kind: Kind) -> Meta {
+        Meta {
+            id: "chatcmpl-1".into(),
+            created: 1,
+            model: Arc::from("test-model"),
+            kind,
+        }
+    }
+
+    /// Feed a scripted set of engine messages through the stream and collect its SSE payloads.
+    async fn scripted_stream(messages: Vec<Msg>, meta: Meta, include_usage: bool) -> Vec<String> {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        for m in messages {
+            tx.send(m).unwrap();
+        }
+        drop(tx);
+        let mut stream = Stream {
+            rx,
+            queue: VecDeque::new(),
+            meta,
+            include_usage,
+            phase: StreamPhase::Open,
+        };
+        let mut out = Vec::new();
+        while let Some(data) = stream.next().await {
+            out.push(data);
+        }
+        out
+    }
+
+    #[test]
+    fn stream_emits_pieces_then_finish_then_done() {
+        let out = block_on(scripted_stream(
+            vec![
+                Msg::Piece(Piece::Reasoning("think".into())),
+                Msg::Piece(Piece::Content("hi".into())),
+                Msg::Done(Finish {
+                    reason: "stop",
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                }),
+            ],
+            stream_meta(Kind::Chat),
+            false,
+        ));
+        assert_eq!(out.len(), 4);
+        assert!(out[0].contains("\"reasoning_content\":\"think\""));
+        assert!(out[1].contains("\"content\":\"hi\""));
+        assert!(out[2].contains("\"finish_reason\":\"stop\""));
+        assert_eq!(out[3], "[DONE]");
+    }
+
+    #[test]
+    fn stream_usage_chunk_precedes_done() {
+        let out = block_on(scripted_stream(
+            vec![Msg::Done(Finish {
+                reason: "length",
+                prompt_tokens: 5,
+                completion_tokens: 7,
+            })],
+            stream_meta(Kind::Chat),
+            true,
+        ));
+        assert_eq!(out.len(), 3);
+        assert!(out[1].contains("\"completion_tokens\":7"));
+        assert_eq!(out[2], "[DONE]");
+    }
+
+    #[test]
+    fn stream_error_is_a_chunk_then_done() {
+        let out = block_on(scripted_stream(
+            vec![Msg::Failed(ApiError::bad("boom"))],
+            stream_meta(Kind::Text),
+            false,
+        ));
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("\"message\":\"boom\""));
+        assert_eq!(out[1], "[DONE]");
+    }
+
+    #[test]
+    fn stream_closed_channel_finishes_cleanly() {
+        let out = block_on(scripted_stream(vec![], stream_meta(Kind::Text), false));
+        assert_eq!(out, vec!["[DONE]"]);
+    }
+
+    #[test]
+    fn stream_ignores_messages_after_terminal() {
+        let out = block_on(scripted_stream(
+            vec![
+                Msg::Done(Finish {
+                    reason: "stop",
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                }),
+                Msg::Piece(Piece::Content("late".into())),
+            ],
+            stream_meta(Kind::Chat),
+            false,
+        ));
+        assert_eq!(out.len(), 2);
+        assert!(!out.iter().any(|s| s.contains("late")));
+        assert_eq!(out[1], "[DONE]");
+    }
 
     /// The reasoning/answer split, including the one-shot whitespace trim after the tag.
     #[test]
