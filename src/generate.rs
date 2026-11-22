@@ -45,6 +45,21 @@ pub struct SpecStats {
     pub accepted: usize,
 }
 
+/// Decode path chosen for one turn. The requested draft count is clamped to zero when the
+/// model has no MTP head; the chosen mode then drives both prefill and decode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeMode {
+    Speculative(usize),
+    Greedy,
+    Sampled,
+}
+
+/// Speculative decoding verifies the pending token plus `k` drafts in one pass, so it must
+/// reserve `k + 1` context slots ahead of the plain decode paths.
+fn has_room_for_verify(st: &State, k: usize) -> bool {
+    st.pos + k + 1 < st.max_ctx
+}
+
 #[derive(Default)]
 pub struct Outcome {
     pub radix_hit: usize,
@@ -68,10 +83,17 @@ pub fn generate(
 ) -> Result<Outcome> {
     let spec_k = if model.has_mtp() { p.spec_k } else { 0 };
     let mut sampler = sampler::Sampler::new(p.sampling.clone());
+    let mode = if spec_k > 0 {
+        DecodeMode::Speculative(spec_k)
+    } else if sampler.is_greedy() {
+        DecodeMode::Greedy
+    } else {
+        DecodeMode::Sampled
+    };
     let stats_before = model.stats.clone();
 
     let t0 = Instant::now();
-    let (mut logits, mut h_prev, radix_hit) = if spec_k > 0 {
+    let (mut logits, mut h_prev, radix_hit) = if matches!(mode, DecodeMode::Speculative(_)) {
         let (l, h, hit) = model.prefill_spec(prompt, p.chunk, st)?;
         (l, Some(h), hit)
     } else {
@@ -91,51 +113,57 @@ pub fn generate(
         on_token(next)
     };
     let mut spec = SpecStats::default();
-    if spec_k > 0 {
-        let mut pending = sampler.sample(&logits);
-        let mut emitted = 0usize;
-        while emitted < p.max_new {
-            if emit(pending)? {
-                break;
-            }
-            emitted += 1;
-            if emitted >= p.max_new || st.pos + spec_k + 1 >= st.max_ctx {
-                break;
-            }
-            let out =
-                model.spec_step(st, pending, h_prev.as_ref().unwrap(), spec_k, &mut sampler)?;
-            spec.steps += 1;
-            spec.drafted += out.drafted;
-            spec.accepted += out.accepted.len();
-            let mut stopped = false;
-            for d in out.accepted {
-                if emitted >= p.max_new || emit(d)? {
-                    stopped = true;
+    match mode {
+        DecodeMode::Speculative(k) => {
+            let mut pending_token = sampler.sample(&logits);
+            let mut emitted = 0usize;
+            while emitted < p.max_new {
+                if emit(pending_token)? {
                     break;
                 }
                 emitted += 1;
+                if emitted >= p.max_new || !has_room_for_verify(st, k) {
+                    break;
+                }
+                let hidden = h_prev
+                    .as_ref()
+                    .expect("speculative prefill provides a hidden state");
+                let out = model.spec_step(st, pending_token, hidden, k, &mut sampler)?;
+                spec.steps += 1;
+                spec.drafted += out.drafted;
+                spec.accepted += out.accepted.len();
+                let mut stopped_while_drafting = false;
+                for d in out.accepted {
+                    if emitted >= p.max_new || emit(d)? {
+                        stopped_while_drafting = true;
+                        break;
+                    }
+                    emitted += 1;
+                }
+                if stopped_while_drafting {
+                    break;
+                }
+                pending_token = out.next;
+                h_prev = Some(out.hidden);
             }
-            if stopped {
-                break;
-            }
-            pending = out.next;
-            h_prev = Some(out.hidden);
         }
-    } else if sampler.is_greedy() {
-        let mut next = sampler.sample(&logits);
-        for _ in 0..p.max_new {
-            if emit(next)? || st.pos >= st.max_ctx {
-                break;
+        DecodeMode::Greedy => {
+            let mut next = sampler.sample(&logits);
+            for _ in 0..p.max_new {
+                if emit(next)? || st.pos >= st.max_ctx {
+                    break;
+                }
+                next = model.forward_greedy(&[next], st)?;
             }
-            next = model.forward_greedy(&[next], st)?;
         }
-    } else {
-        for _ in 0..p.max_new {
-            let next = sampler.sample(&logits);
-            if emit(next)? || st.pos >= st.max_ctx {
-                break;
+        DecodeMode::Sampled => {
+            for _ in 0..p.max_new {
+                let next = sampler.sample(&logits);
+                if emit(next)? || st.pos >= st.max_ctx {
+                    break;
+                }
+                logits = model.forward(&[next], st)?;
             }
-            logits = model.forward(&[next], st)?;
         }
     }
     drop(emit);
@@ -147,6 +175,6 @@ pub fn generate(
         decode_secs: t1.elapsed().as_secs_f64(),
         prefill_stats: stats0.since(&stats_before),
         decode_stats: model.stats.since(&stats0),
-        spec: (spec_k > 0).then_some(spec),
+        spec: matches!(mode, DecodeMode::Speculative(_)).then_some(spec),
     })
 }
