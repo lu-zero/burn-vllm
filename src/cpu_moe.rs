@@ -157,6 +157,12 @@ pub fn dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX, x_f32: &[f32]) -> f32 {
             };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if ty == GgmlType::Q6K {
+        if let Some(v) = neon::dot_q6k_q8(src, qx) {
+            return v;
+        }
+    }
     dot_scalar(ty, src, x_f32)
 }
 
@@ -1422,4 +1428,191 @@ pub fn run_experts_cpu(
             });
         });
     });
+}
+
+/// ARM NEON quantized dots. NEON is baseline on aarch64; Q6_K additionally needs DotProd
+/// (USDOT), which is checked at runtime so other aarch64 cores keep using the scalar path.
+/// The accumulation order mirrors `dot_scalar` so results are bit-identical.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+    use std::arch::is_aarch64_feature_detected;
+    use std::sync::OnceLock;
+
+    fn dotprod_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| is_aarch64_feature_detected!("dotprod"))
+    }
+
+    /// Q6_K superblocks against our per-32 Q8 activations. `None` means DotProd is absent
+    /// and the caller should fall back to `dot_scalar`.
+    pub fn dot_q6k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        // SAFETY: the runtime check above confirmed DotProd support.
+        Some(unsafe { dot_q6k_q8_dotprod(src, qx) })
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q6k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 210);
+            let lo4 = vdupq_n_u8(0x0F);
+            let hi2 = vdupq_n_u8(0x03);
+            let bias32 = vdupq_n_s8(32);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 210);
+                let d = f16::from_le_bytes([*b.add(208), *b.add(209)]).to_f32();
+                ql_block(b, qp, dp, d, sb, lo4, hi2, bias32, zero, &mut sum);
+                qp = qp.add(256);
+            }
+            sum
+        }
+    }
+
+    /// One super-block: two halves of 128 values each, four 32-value planes per half.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn ql_block(
+        b: *const u8,
+        qp: *const i8,
+        dp: *const f32,
+        d: f32,
+        sb: usize,
+        lo4: uint8x16_t,
+        hi2: uint8x16_t,
+        bias32: int8x16_t,
+        zero: int32x4_t,
+        sum: &mut f32,
+    ) {
+        unsafe {
+            for n in 0..2usize {
+                let ql = b.add(64 * n);
+                let qh = b.add(128 + 32 * n);
+                let sc = b.add(192 + 8 * n) as *const i8;
+                for k in 0..4usize {
+                    let shift = k * 2;
+                    let qlo = ql.add((k & 1) * 32);
+                    let dx = *dp.add(sb * 8 + n * 4 + k);
+                    for half in 0..2usize {
+                        let lo = vld1q_u8(qlo.add(half * 16));
+                        let hv = vld1q_u8(qh.add(half * 16));
+                        let nib = if k < 2 {
+                            vandq_u8(lo, lo4)
+                        } else {
+                            vshrq_n_u8(lo, 4)
+                        };
+                        let bits = match shift {
+                            0 => hv,
+                            2 => vshrq_n_u8(hv, 2),
+                            4 => vshrq_n_u8(hv, 4),
+                            _ => vshrq_n_u8(hv, 6),
+                        };
+                        let w = vsubq_s8(
+                            vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(vandq_u8(bits, hi2), 4))),
+                            bias32,
+                        );
+                        let x = vld1q_s8(qp.add(n * 128 + k * 32 + half * 16));
+                        let dot = vaddvq_s32(vdotq_s32(zero, w, x));
+                        let scale = d * dx * *sc.add(k * 2 + half) as i8 as f32;
+                        *sum += (dot as f32) * scale;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Order-matched scalar reference: same (sb, n, k, half) traversal as the NEON kernel.
+        fn ordered_scalar(src: &[u8], qx: &QuantX) -> f32 {
+            let nsb = qx.d.len() / 8;
+            let mut sum = 0.0f32;
+            for sb in 0..nsb {
+                let b = &src[sb * 210..(sb + 1) * 210];
+                let d = f16::from_le_bytes([b[208], b[209]]).to_f32();
+                for n in 0..2 {
+                    let ql = &b[64 * n..64 * n + 64];
+                    let qh = &b[128 + 32 * n..128 + 32 * n + 32];
+                    let sc = &b[192 + 8 * n..192 + 8 * n + 8];
+                    for k in 0..4 {
+                        let dx = qx.d[sb * 8 + n * 4 + k];
+                        for half in 0..2 {
+                            let mut dot = 0i32;
+                            for i in 0..16 {
+                                let qlo = ql[(k & 1) * 32 + half * 16 + i];
+                                let nib = if k < 2 { qlo & 0x0F } else { qlo >> 4 };
+                                let bits = (qh[half * 16 + i] >> (k * 2)) & 3;
+                                let w = ((nib | (bits << 4)) as i8) as i32 - 32;
+                                let xv = qx.qs[sb * 256 + n * 128 + k * 32 + half * 16 + i] as i32;
+                                dot += w * xv;
+                            }
+                            let scale = d * dx * sc[k * 2 + half] as i8 as f32;
+                            sum += (dot as f32) * scale;
+                        }
+                    }
+                }
+            }
+            sum
+        }
+
+        fn sample() -> (Vec<u8>, Vec<f32>, QuantX) {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let blocks = 4;
+            let mut src = vec![0u8; blocks * 210];
+            let mut x = vec![0.0f32; blocks * 256];
+            for sb in 0..blocks {
+                let b = &mut src[sb * 210..(sb + 1) * 210];
+                b[208..210].copy_from_slice(
+                    &f16::from_f32(0.5 + (next() & 0xFF) as f32 / 255.0).to_le_bytes(),
+                );
+                for byte in b[..208].iter_mut() {
+                    *byte = next() as u8;
+                }
+                for v in x[sb * 256..(sb + 1) * 256].iter_mut() {
+                    *v = ((next() >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+                }
+            }
+            let qx = QuantX::from_f32(&x);
+            (src, x, qx)
+        }
+
+        #[test]
+        fn q6k_neon_matches_ordered_scalar_bit_exactly() {
+            if !dotprod_available() {
+                eprintln!("skipping: host has no DotProd support");
+                return;
+            }
+            let (src, _, qx) = sample();
+            let expected = ordered_scalar(&src, &qx);
+            let actual = unsafe { dot_q6k_q8_dotprod(&src, &qx) };
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+
+        #[test]
+        fn q6k_neon_is_close_to_the_portable_dot() {
+            if !dotprod_available() {
+                eprintln!("skipping: host has no DotProd support");
+                return;
+            }
+            let (src, x, qx) = sample();
+            let neon = unsafe { dot_q6k_q8_dotprod(&src, &qx) };
+            let portable = dot(GgmlType::Q6K, &src, &x);
+            assert!((neon - portable).abs() <= 1e-3 * portable.abs().max(1.0));
+        }
+    }
 }
