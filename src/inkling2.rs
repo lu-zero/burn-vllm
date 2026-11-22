@@ -367,11 +367,13 @@ fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) ->
     use rayon::prelude::*;
     (0..rows)
         .into_par_iter()
-        .map(|r| {
-            let mut w = vec![0.0f32; cols];
-            crate::quant::dequant(ty, &raw[r * rb..(r + 1) * rb], &mut w);
-            w.iter().zip(x).map(|(a, b)| a * b).sum()
-        })
+        .map_init(
+            || vec![0.0f32; cols], // one scratch buffer per worker, not per row
+            |w, r| {
+                crate::quant::dequant(ty, &raw[r * rb..(r + 1) * rb], w);
+                w.iter().zip(x).map(|(a, b)| a * b).sum()
+            },
+        )
         .collect()
 }
 
