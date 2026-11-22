@@ -22,6 +22,7 @@ pub enum GgmlType {
     F32,
     F16,
     Q8_0,
+    Q5_1,
     Q3K,
     Q4K,
     Q5K,
@@ -40,6 +41,7 @@ impl GgmlType {
             1 => Self::F16,
             8 => Self::Q8_0,
             11 => Self::Q3K,
+            7 => Self::Q5_1,
             12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
@@ -58,6 +60,7 @@ impl GgmlType {
             Self::F32 => (1, 4),
             Self::F16 | Self::Bf16 => (1, 2),
             Self::Q8_0 => (32, 34),
+            Self::Q5_1 => (32, 24),
             Self::Q3K => (256, 110),
             Self::Q4K => (256, 144),
             Self::Q5K => (256, 176),
@@ -79,6 +82,8 @@ impl GgmlType {
     pub fn gpu_fmt(self) -> u32 {
         match self {
             Self::F32 | Self::F16 => fmt::F32,
+            // Host-dequantized into F32 words by `repack`; no dedicated GPU kernel.
+            Self::Q5_1 => fmt::F32,
             Self::Q8_0 => fmt::Q8_0,
             Self::Mxfp4 => fmt::MXFP4,
             Self::Q5K => fmt::Q5K,
@@ -199,6 +204,18 @@ pub fn dequant(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                 let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
                 for j in 0..32 {
                     y[j] = d * (b[2 + j] as i8) as f32;
+                }
+            }
+        }
+        GgmlType::Q5_1 => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let m = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                let (qh, qs) = (&b[4..8], &b[8..24]);
+                for j in 0..32 {
+                    let lo = ((qs[j / 2] >> (4 * (j % 2))) & 0xF) as u32;
+                    let hi = (((qh[j / 8] >> (j % 8)) & 1) << 4) as u32;
+                    y[j] = d * (lo | hi) as f32 - m;
                 }
             }
         }
@@ -411,6 +428,15 @@ pub fn repack(ty: GgmlType, src: &[u8]) -> Packed {
     let mut w1 = vec![0u32; fmt::w1_words(f, numel)];
     match ty {
         GgmlType::F32 | GgmlType::Q5K => copy_words(&mut w0, src),
+        GgmlType::Q5_1 => {
+            // Rare in practice (14 tensors in Inkling-2 APEX Balanced): dequantize on the
+            // host and reuse the F32 GPU path instead of adding a dedicated kernel.
+            let mut f = vec![0f32; numel];
+            dequant(ty, src, &mut f);
+            for (o, v) in w0.iter_mut().zip(f) {
+                *o = v.to_bits();
+            }
+        }
         GgmlType::F16 => {
             for (o, c) in w0.iter_mut().zip(src.chunks_exact(2)) {
                 *o = f16::from_le_bytes([c[0], c[1]]).to_f32().to_bits();
@@ -531,6 +557,24 @@ fn copy_words(dst: &mut [u32], src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q5_1 block = f16 d, f16 m, 4 high-bit bytes, 16 low-nibble bytes (24 bytes / 32 values).
+    #[test]
+    fn q5_1_dequant() {
+        let mut block = [0u8; 24];
+        block[0..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+        block[2..4].copy_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        block[4] = 0b1010_0100; // high bits for values 0..8 (bit 0 clear, bit 2 set)
+        block[8] = 0x10; // value 0 low nibble 0, value 1 low nibble 1
+        let mut out = [0f32; 32];
+        dequant(GgmlType::Q5_1, &block, &mut out);
+        assert_eq!(out[0], 0.5 * 0.0 - 1.0);
+        assert_eq!(out[1], 0.5 * 1.0 - 1.0);
+        // Value 2's high bit is bit 2 of qh[0] (0xA5 → 1), its low nibble is 0.
+        assert_eq!(out[2], 0.5 * 16.0 - 1.0);
+        assert_eq!(GgmlType::from_u32(7).unwrap(), GgmlType::Q5_1);
+        assert_eq!(GgmlType::Q5_1.block(), (32, 24));
+    }
 
     #[test]
     fn e8m0() {
