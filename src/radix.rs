@@ -154,6 +154,14 @@ pub struct PrefixMatch {
     pub gdn_ckpt: Option<Arc<GdnCheckpoint>>,
 }
 
+/// How a prefix match may end. `Any` accepts the longest block-aligned match; `NeedGdn`
+/// only accepts boundaries that have a checkpoint to restore GDN state from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    Any,
+    NeedGdn,
+}
+
 /// Radix prefix tree mapping `KV_PAGE_SIZE`-aligned token blocks to physical KV pages
 /// and optional GDN state checkpoints.
 pub struct RadixTree {
@@ -292,6 +300,26 @@ impl RadixTree {
         require_gdn: bool,
         leave_last: bool,
     ) -> PrefixMatch {
+        // Keep the boolean API; the two boundary rules are named inside the implementation.
+        self.match_prefix_inner(
+            tokens,
+            pool,
+            if require_gdn {
+                MatchMode::NeedGdn
+            } else {
+                MatchMode::Any
+            },
+            leave_last,
+        )
+    }
+
+    fn match_prefix_inner(
+        &mut self,
+        tokens: &[u32],
+        pool: &mut KvPool,
+        mode: MatchMode,
+        leave_last: bool,
+    ) -> PrefixMatch {
         let usable_len = if leave_last {
             tokens.len().saturating_sub(1)
         } else {
@@ -342,19 +370,19 @@ impl RadixTree {
                 if let Some(ckpt) = &node.gdn_ckpt {
                     best_blocks = pos_blocks;
                     best_ckpt = Some(Arc::clone(ckpt));
-                } else if !require_gdn {
+                } else if mode == MatchMode::Any {
                     best_blocks = pos_blocks;
                 }
                 cur = nid;
             } else {
-                if !require_gdn {
+                if mode == MatchMode::Any {
                     best_blocks = pos_blocks;
                 }
                 break;
             }
         }
 
-        let keep_blocks = if require_gdn {
+        let keep_blocks = if mode == MatchMode::NeedGdn {
             best_blocks
         } else {
             path_pages.len()
