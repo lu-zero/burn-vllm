@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = ["cuda", "wgpu"]
+cpu = ["burn-cubecl/cpu"]
 cuda = ["burn-cubecl/cuda"]
 wgpu = ["burn-cubecl/wgpu"]
 

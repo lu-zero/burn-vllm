@@ -25,7 +25,7 @@ struct Cli {
     /// GGUF file (qwen35moe). Default: the Qwen3.5-35B-A3B MXFP4 snapshot in the HF cache.
     #[arg(long)]
     model: Option<PathBuf>,
-    /// Runtime: cuda or wgpu (default: cuda if built, else wgpu).
+    /// Runtime: cuda, wgpu or cpu (default: cuda if built, else wgpu, else cpu).
     #[arg(long)]
     backend: Option<String>,
     /// User message; repeat to test RadixAttention prefix reuse.
@@ -96,9 +96,13 @@ fn device(backend: Option<&str>) -> Result<cubecl::Device> {
         Some("cuda") | None => cubecl::Device::Cuda(Default::default()),
         #[cfg(feature = "wgpu")]
         Some("wgpu") => cubecl::Device::Wgpu(Default::default()),
+        #[cfg(feature = "cpu")]
+        Some("cpu") => cubecl::Device::Cpu(Default::default()),
         #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
         None => cubecl::Device::Wgpu(Default::default()),
-        #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
+        #[cfg(all(feature = "cpu", not(any(feature = "cuda", feature = "wgpu"))))]
+        None => cubecl::Device::Cpu(Default::default()),
+        #[cfg(not(any(feature = "cuda", feature = "wgpu", feature = "cpu")))]
         None => bail!("no GPU backend enabled in this build"),
         Some(b) => bail!("backend {b} not available in this build"),
     })
