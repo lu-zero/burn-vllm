@@ -209,6 +209,7 @@ fn clip(x: &[f32], width: usize, scale: Option<&[f32]>, threshold: f32) -> Vec<f
         }
     }
     for row in out.chunks_exact_mut(width) {
+        // llama.cpp: sqrt(sum_rows(sqr(x))) then scale_bias(+1e-6), i.e. sqrt(sum) + eps.
         let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-6;
         let factor = (threshold / norm).min(1.0).max(0.0);
         for v in row {
@@ -883,19 +884,27 @@ pub fn generate(
     for &t in prompt {
         logits = model.forward(st, t)?;
     }
-    if std::env::var_os("INKLING2_DEBUG").is_some() {
-        let mut top: Vec<(f32, usize)> = logits
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, v)| (v, i))
-            .collect();
-        top.sort_by(|a, b| b.0.total_cmp(&a.0));
-        eprintln!("inkling2 top10: {:?}", &top[..10]);
-    }
-    for _ in 0..max_new {
+    let debug = std::env::var_os("INKLING2_DEBUG").is_some();
+    for step in 0..max_new {
+        if debug {
+            let mut top: Vec<(f32, usize)> = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, v)| (v, i))
+                .collect();
+            top.sort_by(|a, b| b.0.total_cmp(&a.0));
+            eprintln!(
+                "STEP {step} TOP: {}",
+                top[..8]
+                    .iter()
+                    .map(|(v, i)| format!("{i}:{v:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         let next = sampler.sample(&logits);
-        if std::env::var_os("INKLING2_DEBUG").is_some() {
+        if debug {
             eprint!("{next} ");
         }
         on_token(next);
