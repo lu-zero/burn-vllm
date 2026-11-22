@@ -494,13 +494,15 @@ fn submit(
         seed: c.seed.unwrap_or(d.seed),
     };
     let (reply, rx) = tokio_mpsc::unbounded_channel();
+    // `max_completion_tokens` wins over the legacy `max_tokens`, then the context size.
+    let max_new = c
+        .max_completion_tokens
+        .or(c.max_tokens)
+        .unwrap_or(state.ctx);
     let job = Job {
         prompt,
         think,
-        max_new: c
-            .max_completion_tokens
-            .or(c.max_tokens)
-            .unwrap_or(state.ctx),
+        max_new,
         sampling,
         stops,
         reply,
@@ -745,16 +747,15 @@ fn chat_text(state: &AppState, req: &ChatRequest) -> Result<(String, bool), ApiE
     Ok((prompt, think))
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
+/// Choose the response mode once for both endpoints, so stream and buffered responses
+/// cannot drift in how they read `stream_options.include_usage`.
+async fn respond(
+    rx: tokio_mpsc::UnboundedReceiver<Msg>,
+    meta: Meta,
+    common: &Common,
 ) -> Result<Response, ApiError> {
-    let (prompt, think) = chat_text(&state, &req)?;
-    let rx = submit(&state, prompt, think, &req.common)?;
-    let meta = Meta::new(&state, Kind::Chat);
-    if req.common.stream {
-        let include_usage = req
-            .common
+    if common.stream {
+        let include_usage = common
             .stream_options
             .as_ref()
             .is_some_and(|o| o.include_usage);
@@ -764,23 +765,22 @@ async fn chat_completions(
     Ok(Json(meta.whole(&collected, &finish)).into_response())
 }
 
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Response, ApiError> {
+    let (prompt, think) = chat_text(&state, &req)?;
+    let rx = submit(&state, prompt, think, &req.common)?;
+    respond(rx, Meta::new(&state, Kind::Chat), &req.common).await
+}
+
 async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     // Legacy endpoint: the prompt is fed verbatim, without the chat template.
     let rx = submit(&state, req.prompt, false, &req.common)?;
-    let meta = Meta::new(&state, Kind::Text);
-    if req.common.stream {
-        let include_usage = req
-            .common
-            .stream_options
-            .as_ref()
-            .is_some_and(|o| o.include_usage);
-        return Ok(stream_response(rx, meta, include_usage));
-    }
-    let (collected, finish) = collect(rx).await?;
-    Ok(Json(meta.whole(&collected, &finish)).into_response())
+    respond(rx, Meta::new(&state, Kind::Text), &req.common).await
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
