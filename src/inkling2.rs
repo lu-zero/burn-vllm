@@ -895,6 +895,9 @@ pub fn generate(
     }
     for _ in 0..max_new {
         let next = sampler.sample(&logits);
+        if std::env::var_os("INKLING2_DEBUG").is_some() {
+            eprint!("{next} ");
+        }
         on_token(next);
         logits = model.forward(st, next)?;
     }
