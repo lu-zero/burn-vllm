@@ -81,6 +81,51 @@ fn tile_width(max_cnt: usize) -> usize {
     }
 }
 
+/// How attention work is divided across cubes. `Split` writes partial outputs plus
+/// log-sum-exp metadata, which `attention_combine` must fold into the final output.
+enum SplitPlan {
+    Single,
+    Split { nsplit: usize, split_len: usize },
+}
+
+/// Flash-decoding split for contiguous KV cache: only single-token decode profits from
+/// splitting the keys across cubes.
+fn attention_split_plan(t: usize, nkeys: usize) -> SplitPlan {
+    let split_len = (nkeys.div_ceil(32).div_ceil(32) * 32).max(256);
+    let nsplit = if t == 1 { nkeys.div_ceil(split_len) } else { 1 };
+    if nsplit <= 1 {
+        SplitPlan::Single
+    } else {
+        SplitPlan::Split { nsplit, split_len }
+    }
+}
+
+/// Flash-decoding split for the paged KV cache. Prefills of up to 8 tokens also split when
+/// there are enough keys to keep the device busy.
+fn attention_paged_split_plan(t: usize, nh: usize, nkeys: usize) -> SplitPlan {
+    let target_cubes = 256usize;
+    let want_splits = if t <= 8 && nkeys >= 1024 {
+        (target_cubes / (nh * t)).clamp(1, 32)
+    } else {
+        1
+    };
+    let split_len = if want_splits > 1 {
+        (nkeys.div_ceil(want_splits).div_ceil(32) * 32).max(256)
+    } else {
+        nkeys.max(1)
+    };
+    let nsplit = if want_splits > 1 {
+        nkeys.div_ceil(split_len)
+    } else {
+        1
+    };
+    if nsplit <= 1 {
+        SplitPlan::Single
+    } else {
+        SplitPlan::Split { nsplit, split_len }
+    }
+}
+
 impl Gpu {
     pub fn new(device: CubeDevice) -> Self {
         let client = device.client();
@@ -471,31 +516,30 @@ impl Gpu {
         let out = self.alloc(t * nh * hd);
         let scale = 1.0 / (hd as f32).sqrt();
         let nkeys = pos0 + t;
-        // Decode: split the keys across cubes (flash-decoding) once one cube per head
-        // would leave the device mostly idle.
-        let split_len = (nkeys.div_ceil(32).div_ceil(32) * 32).max(256);
-        let nsplit = if t == 1 { nkeys.div_ceil(split_len) } else { 1 };
-        if nsplit <= 1 {
-            kernels::attention::launch(
-                &self.client,
-                CubeCount::Static(nh as u32, t as u32, 1),
-                CubeDim::new_1d(hd as u32),
-                q.arg(),
-                qg.arg(),
-                k_cache.argv(),
-                v_cache.arg(),
-                out.arg(),
-                self.dummy.arg(),
-                nh as u32,
-                nkv as u32,
-                pos0 as u32,
-                nkeys as u32,
-                scale,
-                hd,
-                false,
-            );
-            return out;
-        }
+        let (nsplit, split_len) = match attention_split_plan(t, nkeys) {
+            SplitPlan::Single => {
+                kernels::attention::launch(
+                    &self.client,
+                    CubeCount::Static(nh as u32, t as u32, 1),
+                    CubeDim::new_1d(hd as u32),
+                    q.arg(),
+                    qg.arg(),
+                    k_cache.argv(),
+                    v_cache.arg(),
+                    out.arg(),
+                    self.dummy.arg(),
+                    nh as u32,
+                    nkv as u32,
+                    pos0 as u32,
+                    nkeys as u32,
+                    scale,
+                    hd,
+                    false,
+                );
+                return out;
+            }
+            SplitPlan::Split { nsplit, split_len } => (nsplit, split_len),
+        };
         let parts = self.alloc(t * nh * nsplit * hd);
         let ml = self.alloc(t * nh * nsplit * 2);
         kernels::attention::launch(
@@ -600,45 +644,32 @@ impl Gpu {
         let out = self.alloc(t * nh * hd);
         let scale = 1.0 / (hd as f32).sqrt();
         let nkeys = pos0 + t;
-        let target_cubes = 256usize;
-        let want_splits = if t <= 8 && nkeys >= 1024 {
-            (target_cubes / (nh * t)).clamp(1, 32)
-        } else {
-            1
+        let (nsplit, split_len) = match attention_paged_split_plan(t, nh, nkeys) {
+            SplitPlan::Single => {
+                kernels::attention_paged::launch(
+                    &self.client,
+                    CubeCount::Static(nh as u32, t as u32, 1),
+                    CubeDim::new_1d(hd as u32),
+                    q.arg(),
+                    qg.arg(),
+                    k_pool.argv(),
+                    v_pool.arg(),
+                    page_table.arg(),
+                    out.arg(),
+                    self.dummy.arg(),
+                    nh as u32,
+                    nkv as u32,
+                    pos0 as u32,
+                    page_size as u32,
+                    nkeys as u32,
+                    scale,
+                    hd,
+                    false,
+                );
+                return out;
+            }
+            SplitPlan::Split { nsplit, split_len } => (nsplit, split_len),
         };
-        let split_len = if want_splits > 1 {
-            (nkeys.div_ceil(want_splits).div_ceil(32) * 32).max(256)
-        } else {
-            nkeys.max(1)
-        };
-        let nsplit = if want_splits > 1 {
-            nkeys.div_ceil(split_len)
-        } else {
-            1
-        };
-        if nsplit <= 1 {
-            kernels::attention_paged::launch(
-                &self.client,
-                CubeCount::Static(nh as u32, t as u32, 1),
-                CubeDim::new_1d(hd as u32),
-                q.arg(),
-                qg.arg(),
-                k_pool.argv(),
-                v_pool.arg(),
-                page_table.arg(),
-                out.arg(),
-                self.dummy.arg(),
-                nh as u32,
-                nkv as u32,
-                pos0 as u32,
-                page_size as u32,
-                nkeys as u32,
-                scale,
-                hd,
-                false,
-            );
-            return out;
-        }
         let parts = self.alloc(t * nh * nsplit * hd);
         let ml = self.alloc(t * nh * nsplit * 2);
         kernels::attention_paged::launch(
@@ -884,5 +915,47 @@ impl Gpu {
     }
     pub fn sync(&self) {
         futures_lite::future::block_on(self.client.sync()).expect("device sync");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_attention_split_plan() {
+        // Prefill never splits, however long the context.
+        assert!(matches!(attention_split_plan(4, 8192), SplitPlan::Single));
+        // Short decode stays on one cube per head.
+        assert!(matches!(attention_split_plan(1, 256), SplitPlan::Single));
+        // Long decode splits, with a split length aligned to the kernel's 32-key tile.
+        match attention_split_plan(1, 8192) {
+            SplitPlan::Split { nsplit, split_len } => {
+                assert!(nsplit > 1);
+                assert!(split_len >= 256);
+                assert_eq!(split_len % 32, 0);
+            }
+            SplitPlan::Single => panic!("expected a split plan for long decode"),
+        }
+    }
+
+    #[test]
+    fn paged_attention_split_plan() {
+        // Too few keys, or too many tokens, stay on a single launch.
+        assert!(matches!(
+            attention_paged_split_plan(1, 32, 512),
+            SplitPlan::Single
+        ));
+        assert!(matches!(
+            attention_paged_split_plan(16, 32, 8192),
+            SplitPlan::Single
+        ));
+        match attention_paged_split_plan(1, 32, 8192) {
+            SplitPlan::Split { nsplit, split_len } => {
+                assert!(nsplit > 1);
+                assert_eq!(split_len % 32, 0);
+            }
+            SplitPlan::Single => panic!("expected a split plan for paged decode"),
+        }
     }
 }
