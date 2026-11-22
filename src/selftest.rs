@@ -11,6 +11,29 @@ use anyhow::{Result, ensure};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Targeted A/B: `SELFTEST_FILTER` keeps only labels containing the substring, and
+/// `SELFTEST_M` keeps only those m values (comma separated). Unset means run everything.
+fn selected(label: &str) -> bool {
+    match std::env::var("SELFTEST_FILTER") {
+        Ok(f) => !f.is_empty() && label.contains(&f),
+        Err(_) => true,
+    }
+}
+
+fn selected_m(m: usize) -> bool {
+    match std::env::var("SELFTEST_M") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .any(|x| x == m),
+        Err(_) => true,
+    }
+}
+
+fn filtered() -> bool {
+    std::env::var_os("SELFTEST_FILTER").is_some() || std::env::var_os("SELFTEST_M").is_some()
+}
+
 /// Per-kernel decode-shape timings (device-synchronized averages).
 pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
     let mut rng = Rng(42);
@@ -28,9 +51,11 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
     };
     let small = gpu.upload_f32(&rng.vec(2048));
     let small2 = gpu.upload_f32(&rng.vec(2048));
-    time("launch overhead (add 2048)", 2000, &mut || {
-        gpu.add_inplace(&small, &small2, 2048)
-    });
+    if selected("launch overhead (add 2048)") {
+        time("launch overhead (add 2048)", 2000, &mut || {
+            gpu.add_inplace(&small, &small2, 2048)
+        });
+    }
     for (label, name) in [
         ("qmatmul Q8_0 8192x2048 m=1", "blk.0.attn_qkv.weight"),
         ("qmatmul Q8_0 2048x4096 m=1", "blk.0.ssm_out.weight"),
@@ -48,6 +73,9 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
         ),
         ("qmatmul Q8_0 248320x2048 m=1", "output.weight"),
     ] {
+        if !selected(label) {
+            continue;
+        }
         let t = g.tensor(name)?;
         let w = qweight(
             gpu,
@@ -60,9 +88,22 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
         let out = gpu.alloc(w.n);
         let us = time(label, 50, &mut || gpu.qmatmul(&w, &x, 1, &out, false));
         println!("{:<40} {:>9.1} GB/s", "", w.bytes() as f64 / us / 1e3);
+        // Native dot on the same mmap'd rows, for A/B against the device kernel.
+        let raw = g.bytes(t);
+        let rb = t.ty.row_bytes(w.k);
+        let xn = rng.vec(w.k);
+        time(&format!("  cpu_moe::dot {label} m=1"), 200, &mut || {
+            let sum: f32 = (0..w.n)
+                .map(|r| cpu_moe::dot(t.ty, &raw[r * rb..(r + 1) * rb], &xn))
+                .sum();
+            std::hint::black_box(sum);
+        });
         // Prefill crossover between the streamed kernel and dequant + tiled GEMM.
         if w.n < 100_000 {
             for m in [32usize, 128] {
+                if !selected_m(m) {
+                    continue;
+                }
                 let x = gpu.upload_f32(&rng.vec(m * w.k));
                 let o = gpu.alloc(m * w.n);
                 time(&format!("  qmatmul m={m}"), 10, &mut || {
@@ -73,6 +114,10 @@ pub fn bench(gpu: &Gpu, g: &Gguf) -> Result<()> {
                 });
             }
         }
+    }
+    if filtered() {
+        // A targeted bench run only measures the selected qmatmul cases above.
+        return Ok(());
     }
     let h = gpu.upload_f32(&rng.vec(2048));
     let nw = gpu.upload_f32(&rng.vec(2048));
@@ -369,7 +414,7 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
         ("exps down L1", "blk.1.ffn_down_exps.weight", Some(2), 257),
     ];
     for (label, name, e, rows) in cases {
-        if g.tensor(name).is_err() {
+        if !selected(label) || g.tensor(name).is_err() {
             continue;
         }
         let (ty, k, raw) = slice(g, name, e, rows)?;
@@ -392,6 +437,9 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
             check(&format!("{label} cpu_moe::dot"), &got, &want, 1e-2)?;
         }
         for m in [1usize, 3, 8, 13, 40] {
+            if !selected_m(m) {
+                continue;
+            }
             let x = rng.vec(m * k);
             let want = cpu_matmul(&wf, &x, rows, k, m);
             let xb = gpu.upload_f32(&x);
@@ -415,15 +463,17 @@ pub fn run(gpu: &Gpu, g: &Gguf) -> Result<()> {
             }
         }
     }
-    slot_write_test(gpu)?;
-    if g.tensor("blk.0.ffn_gate_exps.weight").is_ok() {
-        moe_test(gpu, g, &mut rng)?;
+    if !filtered() {
+        slot_write_test(gpu)?;
+        if g.tensor("blk.0.ffn_gate_exps.weight").is_ok() {
+            moe_test(gpu, g, &mut rng)?;
+        }
+        gdn_test(gpu, &mut rng)?;
+        attn_test(gpu, &mut rng)?;
+        argmax_test(gpu, &mut rng)?;
+        paged_attn_test(gpu, &mut rng)?;
+        radix_test(gpu)?;
     }
-    gdn_test(gpu, &mut rng)?;
-    attn_test(gpu, &mut rng)?;
-    argmax_test(gpu, &mut rng)?;
-    paged_attn_test(gpu, &mut rng)?;
-    radix_test(gpu)?;
     println!("selftest passed");
     Ok(())
 }
