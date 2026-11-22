@@ -1150,6 +1150,36 @@ pub fn run_experts_cpu_decode(
     });
 }
 
+/// Which CPU expert kernel to run. `Decode` is the zero-allocation single-token fast path
+/// (jobs converted into `scratch`); `General` is the multi-token path.
+enum ExpertBatch<'a> {
+    Decode(&'a [CpuDecodeJob<'a>]),
+    General,
+}
+
+/// Convert to the decode layout when `t == 1` and the jobs fit in `scratch`. The fast path
+/// assumes one routing pair per expert — assert it instead of silently dropping pairs.
+fn classify_expert_batch<'a>(
+    t: usize,
+    jobs: &[CpuExpertJob<'a>],
+    scratch: &'a mut [CpuDecodeJob<'a>; 16],
+) -> ExpertBatch<'a> {
+    if t == 1 && jobs.len() <= scratch.len() {
+        for (i, j) in jobs.iter().enumerate() {
+            debug_assert_eq!(j.pairs.len(), 1, "t == 1 needs one pair per expert");
+            scratch[i] = CpuDecodeJob {
+                gate_raw: j.gate_raw,
+                up_raw: j.up_raw,
+                down_raw: j.down_raw,
+                weight: j.pairs[0].1,
+            };
+        }
+        ExpertBatch::Decode(&scratch[..jobs.len()])
+    } else {
+        ExpertBatch::General
+    }
+}
+
 /// Run a set of missed experts on CPU and accumulate their weighted outputs into
 /// `out` (`[t, hidden]`, zero-initialized by the caller).
 #[allow(clippy::too_many_arguments)]
@@ -1167,34 +1197,15 @@ pub fn run_experts_cpu(
     if jobs.is_empty() {
         return;
     }
-    if t == 1 {
-        let mut djobs = [CpuDecodeJob {
-            gate_raw: &[],
-            up_raw: &[],
-            down_raw: &[],
-            weight: 0.0,
-        }; 16];
-        if jobs.len() <= djobs.len() {
-            for (i, j) in jobs.iter().enumerate() {
-                djobs[i] = CpuDecodeJob {
-                    gate_raw: j.gate_raw,
-                    up_raw: j.up_raw,
-                    down_raw: j.down_raw,
-                    weight: j.pairs[0].1,
-                };
-            }
-            run_experts_cpu_decode(
-                gate_ty,
-                up_ty,
-                down_ty,
-                &djobs[..jobs.len()],
-                x,
-                hidden,
-                inter,
-                out,
-            );
-            return;
-        }
+    let mut decode_scratch = [CpuDecodeJob {
+        gate_raw: &[],
+        up_raw: &[],
+        down_raw: &[],
+        weight: 0.0,
+    }; 16];
+    if let ExpertBatch::Decode(djobs) = classify_expert_batch(t, jobs, &mut decode_scratch) {
+        run_experts_cpu_decode(gate_ty, up_ty, down_ty, djobs, x, hidden, inter, out);
+        return;
     }
     let gate_row_bytes = gate_ty.row_bytes(hidden);
     let up_row_bytes = up_ty.row_bytes(hidden);
