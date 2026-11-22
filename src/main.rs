@@ -2,6 +2,7 @@ mod cpu_moe;
 mod generate;
 mod gguf;
 mod gpu;
+mod inkling2;
 mod iq_grids;
 mod kernels;
 mod model;
