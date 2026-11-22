@@ -20,6 +20,14 @@ impl Default for Params {
     }
 }
 
+impl Params {
+    /// Greedy decoding is selected by either zero (or negative) temperature or `top_k == 1`.
+    /// The decode loop and `Sampler::sample` must agree on this rule.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0 || self.top_k == 1
+    }
+}
+
 pub struct Sampler {
     p: Params,
     state: u64,
@@ -32,7 +40,7 @@ impl Sampler {
     }
 
     pub fn is_greedy(&self) -> bool {
-        self.p.temperature <= 0.0 || self.p.top_k == 1
+        self.p.is_greedy()
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -51,7 +59,7 @@ impl Sampler {
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0)
         };
-        if self.p.temperature <= 0.0 || self.p.top_k == 1 {
+        if self.p.is_greedy() {
             return argmax();
         }
         let k = if self.p.top_k == 0 {
@@ -92,5 +100,34 @@ impl Sampler {
             }
         }
         idx[cut - 1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_rule() {
+        let base = Params::default();
+        let greedy = |temperature, top_k| Params {
+            temperature,
+            top_k,
+            ..base.clone()
+        };
+        assert!(greedy(1.0, 1).is_greedy());
+        assert!(greedy(0.0, 20).is_greedy());
+        assert!(greedy(-0.5, 20).is_greedy());
+        assert!(!greedy(0.7, 20).is_greedy());
+        assert!(!greedy(1.0, 0).is_greedy());
+    }
+
+    #[test]
+    fn greedy_sample_picks_argmax() {
+        let p = Params {
+            temperature: 0.0,
+            ..Params::default()
+        };
+        assert_eq!(Sampler::new(p).sample(&[0.1, -1.0, 3.0, 2.0]), 2);
     }
 }
