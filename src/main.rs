@@ -98,6 +98,8 @@ fn device(backend: Option<&str>) -> Result<cubecl::Device> {
         Some("wgpu") => cubecl::Device::Wgpu(Default::default()),
         #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
         None => cubecl::Device::Wgpu(Default::default()),
+        #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
+        None => bail!("no GPU backend enabled in this build"),
         Some(b) => bail!("backend {b} not available in this build"),
     })
 }
