@@ -52,7 +52,7 @@ impl Prof {
 }
 
 use crate::cpu_moe::{self, CpuDecodeJob, CpuExpertJob};
-use crate::gguf::{Gguf, TensorInfo};
+use crate::gguf::{Gguf, TensorInfo, Value};
 use crate::gpu::{Buf, Gpu, QWeight};
 use crate::kernels::{MOE_DESC, MOE_MAXM};
 use crate::quant::{self, fmt};
@@ -95,25 +95,55 @@ impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.meta_str("general.architecture")?;
         let moe = arch == "qwen35moe";
+        // Inkling-2 can be tabulated and its config parsed, but its forward pass is not
+        // implemented yet. Parsing it here lets loaders fail later on a specific missing
+        // tensor rather than rejecting the whole file up front.
+        let inkling2 = arch == "inkling2_loop";
         ensure!(
-            moe || arch == "qwen35",
-            "unsupported architecture {arch} (want qwen35 or qwen35moe)"
+            moe || arch == "qwen35" || inkling2,
+            "unsupported architecture {arch} (want qwen35, qwen35moe or inkling2_loop)"
         );
         let k = |s: &str| g.meta_u64(&format!("{arch}.{s}")).map(|v| v as usize);
+        // Inkling-2 stores head counts as one entry per layer; all layers agree on them,
+        // so the first entry is the scalar the rest of the config expects.
+        let head_count = |s: &str| -> Result<usize> {
+            if !inkling2 {
+                return k(s);
+            }
+            let v = g
+                .meta_array(&format!("{arch}.{s}"))?
+                .first()
+                .and_then(Value::as_u64)
+                .with_context(|| format!("missing {arch}.{s}[0]"))?;
+            Ok(v as usize)
+        };
         let vocab = g.tensor("token_embd.weight")?.dims[1] as usize;
         let c = Self {
             n_layers: k("block_count")? - k("nextn_predict_layers").unwrap_or(0),
             hidden: k("embedding_length")?,
             vocab,
-            n_heads: k("attention.head_count")?,
-            n_kv: k("attention.head_count_kv")?,
+            n_heads: head_count("attention.head_count")?,
+            n_kv: head_count("attention.head_count_kv")?,
             head_dim: k("attention.key_length")?,
             rope_dim: k("rope.dimension_count")?,
-            rope_theta: g.meta_f64(&format!("{arch}.rope.freq_base"))? as f32,
+            // Inkling-2 has no RoPE and therefore no freq_base metadata.
+            rope_theta: if inkling2 {
+                10_000.0
+            } else {
+                g.meta_f64(&format!("{arch}.rope.freq_base"))? as f32
+            },
             eps: g.meta_f64(&format!("{arch}.attention.layer_norm_rms_epsilon"))? as f32,
-            n_experts: if moe { k("expert_count")? } else { 0 },
-            topk: if moe { k("expert_used_count")? } else { 0 },
-            expert_inter: if moe {
+            n_experts: if moe || inkling2 {
+                k("expert_count")?
+            } else {
+                0
+            },
+            topk: if moe || inkling2 {
+                k("expert_used_count")?
+            } else {
+                0
+            },
+            expert_inter: if moe || inkling2 {
                 k("expert_feed_forward_length")?
             } else {
                 0
@@ -123,20 +153,35 @@ impl Config {
             } else {
                 0
             },
-            conv_k: k("ssm.conv_kernel")?,
-            ssm_dk: k("ssm.state_size")?,
-            ssm_nk: k("ssm.group_count")?,
-            ssm_nv: k("ssm.time_step_rank")?,
-            full_attn_interval: k("full_attention_interval")?,
-            dense_inter: if moe { 0 } else { k("feed_forward_length")? },
+            // Inkling-2 uses shortconv (l_cache=4) instead of GDN/SSM state.
+            conv_k: if inkling2 { 4 } else { k("ssm.conv_kernel")? },
+            ssm_dk: if inkling2 { 0 } else { k("ssm.state_size")? },
+            ssm_nk: if inkling2 { 0 } else { k("ssm.group_count")? },
+            ssm_nv: if inkling2 {
+                0
+            } else {
+                k("ssm.time_step_rank")?
+            },
+            full_attn_interval: if inkling2 {
+                k("attn_res.block_size")?
+            } else {
+                k("full_attention_interval")?
+            },
+            dense_inter: if moe || inkling2 {
+                0
+            } else {
+                k("feed_forward_length")?
+            },
             n_mtp: k("nextn_predict_layers").unwrap_or(0),
         };
         ensure!(c.topk <= MOE_MAXM, "topk {} > {MOE_MAXM}", c.topk);
         ensure!(c.conv_k == 4, "conv kernel {} unsupported", c.conv_k);
-        ensure!(
-            k("ssm.inner_size")? == c.ssm_nv * c.ssm_dk,
-            "ssm inner size mismatch"
-        );
+        if !inkling2 {
+            ensure!(
+                k("ssm.inner_size")? == c.ssm_nv * c.ssm_dk,
+                "ssm inner size mismatch"
+            );
+        }
         Ok(c)
     }
 

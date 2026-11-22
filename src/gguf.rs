@@ -234,3 +234,31 @@ impl Gguf {
             .with_context(|| format!("gguf: missing/invalid {key}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inkling-2 APEX Balanced is a loader regression: all 704 tensors must tabulate,
+    /// including the 14 ggml type 7 (Q5_1) `ffn_down_exps` tensors.
+    #[test]
+    fn apex_balanced_loads() {
+        let path =
+            Path::new("/mnt/models/inkling2-mini-apex-gguf/Inkling-2-Mini-APEX-Balanced.gguf");
+        if !path.exists() {
+            eprintln!("skipping: APEX GGUF not present");
+            return;
+        }
+        let g = Gguf::open(path).unwrap();
+        assert_eq!(g.meta_str("general.architecture").unwrap(), "inkling2_loop");
+        assert_eq!(g.tensors.len(), 704);
+        assert_eq!(
+            g.tensors
+                .values()
+                .filter(|t| t.ty == GgmlType::Q5_1)
+                .count(),
+            14
+        );
+        assert_eq!(g.tensor("token_embd.weight").unwrap().dims[0], 2304);
+    }
+}
