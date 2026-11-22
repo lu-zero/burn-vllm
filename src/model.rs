@@ -679,12 +679,19 @@ impl Model {
                 }
                 Ok(())
             })?;
+        // Smaller dense Qwen3.5 checkpoints tie the LM head to the embedding table and
+        // omit `output.weight`. Fall back to the embedding tensor in that case.
+        let head_name = if g.tensors.contains_key("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
         let (out_norm, lm_head) =
             gpu.client
                 .memory_persistent_allocation((), |_| -> Result<_> {
                     Ok((
                         upload_f32(gpu_ref, g, "output_norm.weight")?,
-                        upload_weight(gpu_ref, g, "output.weight")?,
+                        upload_weight(gpu_ref, g, head_name)?,
                     ))
                 })?;
         let embd = g.tensor("token_embd.weight")?.clone();
