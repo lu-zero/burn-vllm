@@ -139,7 +139,13 @@ fn main() -> Result<()> {
         } else {
             generate::chat_prompt([("user", args.prompts[0].as_str())], !args.no_think)
         };
-        let prompt = tok.encode(&text)?;
+        let prompt = match std::env::var("INKLING2_PROMPT_IDS") {
+            Ok(v) => v
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect(),
+            Err(_) => tok.encode(&text)?,
+        };
         if std::env::var_os("INKLING2_DEBUG").is_some() {
             eprintln!("inkling2 prompt ids: {prompt:?}");
         }
