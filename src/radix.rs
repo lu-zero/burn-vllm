@@ -89,11 +89,15 @@ impl KvPool {
     /// Allocate one physical page, evicting an unreferenced LRU radix leaf if needed.
     pub fn alloc_page(&mut self, radix: &mut RadixTree) -> Option<u32> {
         if let Some(p) = self.free_pages.pop() {
+            debug_assert_eq!(self.ref_counts[p as usize], 0);
+            debug_assert!(!self.in_radix[p as usize]);
             self.ref_counts[p as usize] = 1;
             return Some(p);
         }
         if radix.evict_one(&self.ref_counts, &mut self.in_radix, &mut self.free_pages) {
             if let Some(p) = self.free_pages.pop() {
+                debug_assert_eq!(self.ref_counts[p as usize], 0);
+                debug_assert!(!self.in_radix[p as usize]);
                 self.ref_counts[p as usize] = 1;
                 return Some(p);
             }
@@ -113,6 +117,8 @@ impl KvPool {
         debug_assert!(self.ref_counts[idx] > 0);
         self.ref_counts[idx] -= 1;
         if self.ref_counts[idx] == 0 && !self.in_radix[idx] {
+            // A page must never be on the free list and owned at the same time.
+            debug_assert!(!self.free_pages.contains(&page_id));
             self.free_pages.push(page_id);
         }
     }
@@ -177,6 +183,35 @@ impl RadixTree {
         }
     }
 
+    /// Attach a checkpoint to a node. This and `clear_checkpoint` are the only places that
+    /// adjust `gdn_ckpt_count`, so the count cannot drift from the tree.
+    fn attach_checkpoint(&mut self, id: usize, ckpt: Arc<GdnCheckpoint>) {
+        let node = self.nodes[id].as_mut().expect("checkpoint node must exist");
+        if node.gdn_ckpt.is_none() {
+            self.gdn_ckpt_count += 1;
+        }
+        node.gdn_ckpt = Some(ckpt);
+    }
+
+    fn clear_checkpoint(&mut self, id: usize) {
+        if let Some(node) = self.nodes[id].as_mut()
+            && node.gdn_ckpt.take().is_some()
+        {
+            self.gdn_ckpt_count = self.gdn_ckpt_count.saturating_sub(1);
+        }
+    }
+
+    fn debug_assert_ckpt_count(&self) {
+        debug_assert_eq!(
+            self.gdn_ckpt_count,
+            self.nodes
+                .iter()
+                .filter(|n| n.as_ref().is_some_and(|n| n.gdn_ckpt.is_some()))
+                .count(),
+            "gdn_ckpt_count drifted from the tree"
+        );
+    }
+
     fn alloc_node(&mut self, node: RadixNode) -> usize {
         if let Some(id) = self.free_ids.pop() {
             self.nodes[id] = Some(node);
@@ -189,11 +224,11 @@ impl RadixTree {
     }
 
     fn free_node(&mut self, id: usize) {
-        if let Some(n) = self.nodes[id].take() {
-            if n.gdn_ckpt.is_some() {
-                self.gdn_ckpt_count = self.gdn_ckpt_count.saturating_sub(1);
-            }
+        if self.nodes[id].is_some() {
+            self.clear_checkpoint(id);
+            self.nodes[id] = None;
             self.free_ids.push(id);
+            self.debug_assert_ckpt_count();
         }
     }
 
@@ -203,8 +238,9 @@ impl RadixTree {
 
     /// Split node `nid` after `keep_blocks` (`1 <= keep_blocks < node.pages.len()`).
     fn split_node(&mut self, nid: usize, keep_blocks: usize) {
-        let keep_toks = keep_blocks * KV_PAGE_SIZE;
         let orig = self.nodes[nid].take().unwrap();
+        debug_assert!(keep_blocks >= 1 && keep_blocks < orig.pages.len());
+        let keep_toks = keep_blocks * KV_PAGE_SIZE;
         let child_tokens = orig.tokens[keep_toks..].to_vec();
         let child_pages = orig.pages[keep_blocks..].to_vec();
         let child_key = Self::block_key(&child_tokens);
@@ -240,6 +276,9 @@ impl RadixTree {
             parent: orig.parent,
             last_access: orig.last_access,
         });
+        // The checkpoint moved from the old node to the new child. Ownership changed, not
+        // the number of checkpoints, so `gdn_ckpt_count` is deliberately untouched here.
+        self.debug_assert_ckpt_count();
     }
 
     /// Find the longest cached `KV_PAGE_SIZE`-aligned prefix of `tokens`.
@@ -361,11 +400,10 @@ impl RadixTree {
                 for &p in &rem_pages {
                     pool.mark_radix(p);
                 }
-                let had_ckpt = gdn_ckpt.is_some();
                 let leaf = RadixNode {
                     tokens: rem_toks,
                     pages: rem_pages,
-                    gdn_ckpt,
+                    gdn_ckpt: None,
                     children: HashMap::new(),
                     parent: Some(cur),
                     last_access: now,
@@ -376,10 +414,11 @@ impl RadixTree {
                     .unwrap()
                     .children
                     .insert(key, leaf_id);
-                if had_ckpt {
-                    self.gdn_ckpt_count += 1;
+                if let Some(ckpt) = gdn_ckpt {
+                    self.attach_checkpoint(leaf_id, ckpt);
                     self.trim_gdn_ckpts();
                 }
+                self.debug_assert_ckpt_count();
                 return;
             };
 
@@ -402,16 +441,13 @@ impl RadixTree {
                 self.split_node(nid, matched);
             }
             pos_blocks += matched;
-            let node = self.nodes[nid].as_mut().unwrap();
-            node.last_access = now;
+            self.nodes[nid].as_mut().unwrap().last_access = now;
             if pos_blocks == nblocks {
-                if gdn_ckpt.is_some() {
-                    if node.gdn_ckpt.is_none() {
-                        self.gdn_ckpt_count += 1;
-                    }
-                    node.gdn_ckpt = gdn_ckpt;
+                if let Some(ckpt) = gdn_ckpt {
+                    self.attach_checkpoint(nid, ckpt);
                     self.trim_gdn_ckpts();
                 }
+                self.debug_assert_ckpt_count();
                 return;
             }
             cur = nid;
@@ -432,11 +468,9 @@ impl RadixTree {
                 .min_by_key(|&(_, ts)| ts)
                 .map(|(id, _)| id);
             let Some(vid) = victim else { break };
-            if let Some(n) = self.nodes[vid].as_mut() {
-                n.gdn_ckpt = None;
-                self.gdn_ckpt_count = self.gdn_ckpt_count.saturating_sub(1);
-            }
+            self.clear_checkpoint(vid);
         }
+        self.debug_assert_ckpt_count();
     }
 
     /// Evict the least-recently-used unreferenced leaf node, freeing its physical pages.
@@ -470,6 +504,9 @@ impl RadixTree {
         let key = Self::block_key(&node.tokens);
         let parent = node.parent;
         for &p in &node.pages {
+            // The victim filter above already ruled out pinned pages.
+            debug_assert!(in_radix[p as usize]);
+            debug_assert!(!free_pages.contains(&p));
             in_radix[p as usize] = false;
             free_pages.push(p);
         }
