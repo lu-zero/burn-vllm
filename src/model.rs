@@ -292,6 +292,31 @@ impl ExpertStore {
         self.slots == n_experts
     }
 
+    /// Update both directions of the residency map in one place. The previous occupant of
+    /// `slot` (if any) becomes non-resident before the new expert takes it.
+    fn occupy(&mut self, e: usize, slot: usize) {
+        if self.expert_in[slot] >= 0 {
+            self.slot_of[self.expert_in[slot] as usize] = -1;
+        }
+        self.expert_in[slot] = e as i32;
+        self.slot_of[e] = slot as i32;
+        debug_assert_eq!(self.slot_of[e], slot as i32);
+        debug_assert_eq!(self.expert_in[slot], e as i32);
+    }
+
+    /// `slot_of[e] == s` and `expert_in[s] == e` must always agree; both are maintained by
+    /// `occupy`, so a mismatch means some other path edited one side by hand.
+    fn debug_assert_residency(&self) {
+        debug_assert!((0..self.slot_of.len()).all(|e| {
+            let s = self.slot_of[e];
+            s < 0 || ((s as usize) < self.slots && self.expert_in[s as usize] == e as i32)
+        }));
+        debug_assert!((0..self.slots).all(|s| {
+            let e = self.expert_in[s];
+            e < 0 || ((e as usize) < self.slot_of.len() && self.slot_of[e as usize] == s as i32)
+        }));
+    }
+
     /// Load experts `(expert, slot)` into their slots: repack in parallel on the host,
     /// then enqueue the device writes (stream-ordered with earlier kernels). Batches are
     /// bounded so the pinned staging they need stays small.
@@ -320,12 +345,9 @@ impl ExpertStore {
             gpu.write_many(writes);
         }
         for &(e, slot) in list {
-            if self.expert_in[slot] >= 0 {
-                self.slot_of[self.expert_in[slot] as usize] = -1;
-            }
-            self.expert_in[slot] = e as i32;
-            self.slot_of[e] = slot as i32;
+            self.occupy(e, slot);
         }
+        self.debug_assert_residency();
     }
 
     /// Repack a single expert on the host (for overlapped promotion before enqueueing DMA).
@@ -349,11 +371,8 @@ impl ExpertStore {
             }
         }
         gpu.write_many(writes);
-        if self.expert_in[slot] >= 0 {
-            self.slot_of[self.expert_in[slot] as usize] = -1;
-        }
-        self.expert_in[slot] = e as i32;
-        self.slot_of[e] = slot as i32;
+        self.occupy(e, slot);
+        self.debug_assert_residency();
     }
 }
 
