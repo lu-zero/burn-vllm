@@ -94,6 +94,15 @@ struct Finish {
     completion_tokens: usize,
 }
 
+/// Why the token callback asked `generate` to stop. Only a stop string suppresses the tail
+/// flush; the other causes end the response the same way natural completion does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    None,
+    StopString,
+    ClientGone,
+}
+
 /// Generated text: reasoning inside the `<think>` block, or the answer after it.
 #[derive(Debug, PartialEq, Eq)]
 enum Piece {
@@ -148,15 +157,21 @@ impl Engine {
         };
         let mut st = self.model.new_state(self.ctx, params.spec_k);
         let mut text = Text::new(&job.stops, job.think);
-        let mut hit_stop = false;
+        let mut cause = StopCause::None;
         let reply = &job.reply;
         let tok = &self.tok;
         let result = generate::generate(&mut self.model, &mut st, &prompt, &params, |id| {
             let (pieces, stop) = text.push(&tok.token_bytes(id));
-            hit_stop = stop;
+            if stop {
+                cause = StopCause::StopString;
+            }
             for piece in pieces {
                 // A closed channel means the client went away: stop generating.
                 if reply.send(Msg::Piece(piece)).is_err() {
+                    // A stop string in this same token takes precedence, as before.
+                    if cause == StopCause::None {
+                        cause = StopCause::ClientGone;
+                    }
                     return Ok(true);
                 }
             }
@@ -166,12 +181,12 @@ impl Engine {
             Ok(out) => {
                 self.model.cache_sequence(&st);
                 self.model.release_state(st);
-                if !hit_stop {
+                if cause != StopCause::StopString {
                     for piece in text.finish() {
                         let _ = reply.send(Msg::Piece(piece));
                     }
                 }
-                let reason = if hit_stop || out.generated < job.max_new {
+                let reason = if cause == StopCause::StopString || out.generated < job.max_new {
                     "stop"
                 } else {
                     "length"
