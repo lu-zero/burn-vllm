@@ -1,11 +1,12 @@
-//! Inkling-2 (`inkling2_loop`) GGUF inventory validation.
+//! Inkling-2 (`inkling2_loop`) tensor inventory and forward pass.
 //!
-//! The APEX checkpoints use a 24-layer looped MoE architecture that shares no tensor names
-//! with Qwen3.5. Before a forward pass can be implemented, every tensor family must be
-//! accounted for; this module checks the real artifact's inventory against the published
-//! W0 tensor census so loading failures point at a specific missing family.
+//! The reference is llama.cpp `src/models/inkling2.cpp` + `inkling2-loop.cpp`. This is a
+//! CPU-first port: it reads mmap'd GGUF bytes directly and uses `cpu_moe::dot_q8` (native
+//! NEON on aarch64), so decode measurements are meaningful without the CubeCL CPU backend.
 
+use crate::cpu_moe::{QuantX, dot_q8};
 use crate::gguf::{Gguf, TensorInfo};
+use crate::quant::GgmlType;
 use anyhow::{Result, ensure};
 
 /// Tensor dimensions in gguf order (`dims[0]` is the contiguous dimension).
@@ -37,7 +38,6 @@ pub fn validate(g: &Gguf) -> Result<()> {
     for i in 0..n_layers {
         let b = format!("blk.{i}.");
         let has = |s: &str| g.tensors.contains_key(&format!("{b}{s}"));
-        // Attention: 24 q/gate heads x 128, 8 kv heads x 128, plus relative-position bias.
         dims(g, &format!("{b}attn_q.weight"), &[hidden, 3072])?;
         dims(g, &format!("{b}attn_gate.weight"), &[hidden, 3072])?;
         dims(g, &format!("{b}attn_k.weight"), &[hidden, 1024])?;
@@ -48,7 +48,6 @@ pub fn validate(g: &Gguf) -> Result<()> {
         dims(g, &format!("{b}attn_rel_clip.weight"), &[16, 24])?;
         dims(g, &format!("{b}attn_sink_proj.weight"), &[hidden, 24])?;
         dims(g, &format!("{b}attn_q_clip.weight"), &[128, 24])?;
-        // Depth-4 shortconv and the MoE router.
         dims(g, &format!("{b}attn_k_conv.weight"), &[4, 1024])?;
         dims(g, &format!("{b}attn_v_conv.weight"), &[4, 1024])?;
         dims(g, &format!("{b}attn_post_conv.weight"), &[4, hidden])?;
@@ -67,8 +66,6 @@ pub fn validate(g: &Gguf) -> Result<()> {
             "{b}ffn_down_exps.weight: unexpected dims {:?}",
             down.dims
         );
-        // Full-attention layers (5, 11, 17, 23) carry a 3-slot residual query;
-        // layer 0 has no attention residual at all.
         if i == 0 {
             ensure!(
                 !has("attn_res_query.weight"),
@@ -80,7 +77,6 @@ pub fn validate(g: &Gguf) -> Result<()> {
             dims(g, &format!("{b}attn_res_query.weight"), &[hidden])?;
         }
         dims(g, &format!("{b}ffn_res_query.weight"), &[hidden])?;
-        // Loop-core layers 6..17 repeat three passes with rank-64 gated controllers.
         if (6..18).contains(&i) {
             for stream in ["q", "k", "v", "ffn"] {
                 dims(
@@ -110,10 +106,804 @@ pub fn validate(g: &Gguf) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Config and small numeric helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub n_layers: usize,
+    pub hidden: usize,
+    pub vocab: usize,
+    pub vocab_unpadded: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub ff_exp: usize,
+    pub n_experts: usize,
+    pub n_expert_used: usize,
+    pub eps: f32,
+    pub qk_clip: f32,
+    pub rel_len: usize,
+    pub rel_extent: usize,
+    pub rel_clip: f32,
+    pub log_floor: usize,
+    pub log_alpha: f32,
+    pub situ_beta: f32,
+    pub situ_lb: f32,
+    pub expert_scale: f32,
+    pub softcap: f32,
+    pub swa: usize,
+    pub conv: usize,
+    pub block: usize,
+    pub loop_start: usize,
+    pub loop_end: usize,
+    pub loop_passes: usize,
+    pub gate_rank: usize,
+}
+
+impl Config {
+    pub fn from_gguf(g: &Gguf) -> Result<Self> {
+        let p = "inkling2_loop.";
+        let u = |s: &str| g.meta_u64(&format!("{p}{s}")).map(|v| v as usize);
+        let f = |s: &str| g.meta_f64(&format!("{p}{s}")).map(|v| v as f32);
+        Ok(Self {
+            n_layers: u("block_count")?,
+            hidden: u("embedding_length")?,
+            vocab: u("vocab_size")?,
+            vocab_unpadded: u("vocab_size_unpadded")?,
+            n_head: g
+                .meta_array(&format!("{p}attention.head_count"))?
+                .first()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24) as usize,
+            n_head_kv: g
+                .meta_array(&format!("{p}attention.head_count_kv"))?
+                .first()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8) as usize,
+            head_dim: u("attention.key_length")?,
+            ff_exp: u("expert_feed_forward_length")?,
+            n_experts: u("expert_count")?,
+            n_expert_used: u("expert_used_count")?,
+            eps: f("attention.layer_norm_rms_epsilon")?,
+            qk_clip: f("attention.qk_clip")?,
+            rel_len: u("attention.relative_length")?,
+            rel_extent: u("attention.relative_extent")?,
+            rel_clip: f("attention.relative_clip")?,
+            log_floor: u("attention.log_scale_floor")?,
+            log_alpha: f("attention.log_scale_alpha")?,
+            situ_beta: f("activation.situ_beta")?,
+            situ_lb: f("activation.situ_linear_beta")?,
+            expert_scale: f("expert_weights_scale").unwrap_or(1.0),
+            softcap: f("final_logit_softcapping").unwrap_or(0.0),
+            swa: u("attention.sliding_window")?,
+            conv: u("shortconv.l_cache")?,
+            block: u("attn_res.block_size")?,
+            loop_start: u("loop.start")?,
+            loop_end: u("loop.end")?,
+            loop_passes: u("loop.count")?,
+            gate_rank: u("loop.gate_rank")?,
+        })
+    }
+
+    /// `sliding_window_pattern` is [T,T,T,T,T,F] x4: T = sliding-window attention,
+    /// F (layers 5, 11, 17, 23) = full attention with separate Q/K/V input norms.
+    fn is_swa(&self, layer: usize) -> bool {
+        layer % self.block != self.block - 1
+    }
+}
+
+fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let sum: f32 = x.iter().map(|v| v * v).sum();
+    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
+    x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
+}
+
+/// Clip each row (head) of `x` to L2 norm <= threshold, after optional per-channel scale.
+fn clip(x: &[f32], width: usize, scale: Option<&[f32]>, threshold: f32) -> Vec<f32> {
+    let mut out = x.to_vec();
+    if let Some(s) = scale {
+        for (v, &c) in out.iter_mut().zip(s) {
+            *v *= c;
+        }
+    }
+    for row in out.chunks_exact_mut(width) {
+        let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-6;
+        let factor = (threshold / norm).min(1.0).max(0.0);
+        for v in row {
+            *v *= factor;
+        }
+    }
+    out
+}
+
+/// Causal short convolution with residual, from llama.cpp `graph::convolve`.
+/// `history` has `conv - 1` rows of `channels` values (oldest first); updated in place.
+fn convolve(
+    cur: &[f32],
+    weight: &[f32],
+    dynamic: Option<&[f32]>,
+    history: &mut [f32],
+    channels: usize,
+    heads: usize,
+    conv: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; channels];
+    for lag in 0..conv {
+        // ggml stores conv weights and dynamic taps as [lag, channel/head] with lag
+        // contiguous: element (lag, c) lives at `c * conv + lag`.
+        let window = if lag + 1 < conv {
+            &history[lag * channels..(lag + 1) * channels]
+        } else {
+            cur
+        };
+        for (i, &x) in window.iter().enumerate() {
+            out[i] += x * weight[i * conv + lag];
+        }
+        if let Some(d) = dynamic {
+            let per_head = channels / heads;
+            for h in 0..heads {
+                let t = d[h * conv + lag];
+                for i in 0..per_head {
+                    out[h * per_head + i] += window[h * per_head + i] * t;
+                }
+            }
+        }
+    }
+    // Shift history left by one row and append the current input.
+    for lag in 0..conv - 2 {
+        let (dst, src) = history.split_at_mut((lag + 1) * channels);
+        dst[lag * channels..(lag + 1) * channels].copy_from_slice(&src[..channels]);
+    }
+    history[(conv - 2) * channels..(conv - 1) * channels].copy_from_slice(cur);
+    let scale = 1.0 / (((if dynamic.is_some() { 2 } else { 1 }) * conv + 1) as f32).sqrt();
+    out.iter()
+        .zip(cur)
+        .map(|(&o, &c)| (o + c) * scale)
+        .collect()
+}
+
+/// Attention over the residual stream, from llama.cpp `graph::mix`.
+fn mix(blocks: &[Vec<f32>], cur: &[f32], queries: &[f32], hidden: usize, eps: f32) -> Vec<f32> {
+    let nq = queries.len() / hidden;
+    let n = blocks.len() + 1;
+    // llama.cpp prepends each block, so the newest block comes first and `cur` is last.
+    let mut all: Vec<Vec<f32>> = blocks.iter().rev().cloned().collect();
+    all.push(cur.to_vec());
+    let mut states = Vec::with_capacity(n * hidden);
+    for b in &all {
+        states.extend_from_slice(b);
+    }
+    // ggml_rms_norm normalizes dim 0 (n_embd) independently for each residual block.
+    let ones = vec![1.0f32; hidden];
+    for block in states.chunks_exact_mut(hidden) {
+        let sum: f32 = block.iter().map(|v| v * v).sum();
+        let s = 1.0 / (sum / hidden as f32 + eps).sqrt();
+        for (v, &one) in block.iter_mut().zip(&ones) {
+            *v *= s * one;
+        }
+    }
+    let scale = 1.0 / (hidden as f32).sqrt();
+    let mut out = vec![0.0f32; hidden * nq];
+    for q in 0..nq {
+        let query = &queries[q * hidden..(q + 1) * hidden];
+        let mut scores = vec![0.0f32; n];
+        for (j, state) in states.chunks_exact(hidden).enumerate() {
+            scores[j] = state.iter().zip(query).map(|(a, b)| a * b).sum::<f32>() * scale;
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for (j, e) in exps.iter().enumerate() {
+            let w = e / sum;
+            for (o, &v) in out[q * hidden..(q + 1) * hidden]
+                .iter_mut()
+                .zip(&states[j * hidden..(j + 1) * hidden])
+            {
+                *o += w * v;
+            }
+        }
+    }
+    out
+}
+
+/// Gated cross-pass message merge, from llama.cpp `graph::control`.
+fn control(
+    cur: &[f32],
+    msg: &[f32],
+    down: &[f32],
+    gain: &[f32],
+    forget: &[f32],
+    cfg: &Config,
+) -> Vec<f32> {
+    let mut gate = rms_norm(cur, &vec![1.0; cur.len()], 1e-6);
+    gate.extend_from_slice(&rms_norm(msg, &vec![1.0; msg.len()], 1e-6));
+    let h = matvec_f32(down, cfg.gate_rank, gate.len(), &gate);
+    let g = matvec_f32(gain, cfg.hidden, cfg.gate_rank, &h);
+    let f = matvec_f32(forget, cfg.hidden, cfg.gate_rank, &h);
+    cur.iter()
+        .zip(msg)
+        .zip(g)
+        .zip(f)
+        .map(|(((&c, &m), gv), fv)| c - fv.tanh() * c + gv.tanh() * m)
+        .collect()
+}
+
+/// Matrix-vector product over a flat F32 weight matrix (row-major, `rows` rows).
+fn matvec_f32(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    assert_eq!(w.len(), rows * cols);
+    use rayon::prelude::*;
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            w[r * cols..(r + 1) * cols]
+                .iter()
+                .zip(x)
+                .map(|(a, b)| a * b)
+                .sum()
+        })
+        .collect()
+}
+
+/// Matrix-vector product over a GGUF weight row slice, using native quantized dots.
+fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    if ty == GgmlType::F32 {
+        let w: &[f32] = bytemuck::cast_slice(&raw[..rows * cols * 4]);
+        return matvec_f32(w, rows, cols, x);
+    }
+    let rb = ty.row_bytes(cols);
+    if std::env::var_os("INKLING2_Q8_DOT").is_some() {
+        // Faster but less accurate: per-32 Q8 activations. llama.cpp uses per-256 Q8_K
+        // activations, so this shifts top logits enough to change greedy tokens.
+        let qx = QuantX::from_f32(x);
+        return (0..rows)
+            .into_par_iter()
+            .map(|r| dot_q8(ty, &raw[r * rb..(r + 1) * rb], &qx, x))
+            .collect();
+    }
+    // Default: exact dequantized dot. Matches llama.cpp's top-1 token on the APEX oracle.
+    use rayon::prelude::*;
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            let mut w = vec![0.0f32; cols];
+            crate::quant::dequant(ty, &raw[r * rb..(r + 1) * rb], &mut w);
+            w.iter().zip(x).map(|(a, b)| a * b).sum()
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Model, state and forward pass
+// ---------------------------------------------------------------------------
+
+struct KvSlot {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+}
+
+pub struct State {
+    kv: Vec<KvSlot>,
+    conv: Vec<Vec<f32>>,
+    pos: usize,
+}
+
+impl State {
+    pub fn new(cfg: &Config) -> Self {
+        let slots = cfg.n_layers + (cfg.loop_passes - 1) * (cfg.loop_end - cfg.loop_start);
+        let channels = 2 * cfg.n_head_kv * cfg.head_dim + 2 * cfg.hidden;
+        Self {
+            kv: (0..slots)
+                .map(|_| KvSlot {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                })
+                .collect(),
+            conv: vec![vec![0.0f32; (cfg.conv - 1) * channels]; slots],
+            pos: 0,
+        }
+    }
+}
+
+pub struct Model<'a> {
+    g: &'a Gguf,
+    cfg: Config,
+}
+
+impl<'a> Model<'a> {
+    pub fn new(g: &'a Gguf) -> Result<Self> {
+        validate(g)?;
+        Ok(Self {
+            g,
+            cfg: Config::from_gguf(g)?,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    fn tensor(&self, name: &str) -> Result<(&TensorInfo, &[u8])> {
+        let t = self.g.tensor(name)?;
+        Ok((t, self.g.bytes(t)))
+    }
+
+    /// Matvec over a 2-D weight tensor; `rows` is `dims[0]`, `cols` is `dims[1]`.
+    fn mat(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        let (t, raw) = self.tensor(name)?;
+        if t.dims.len() == 1 {
+            // A 1-D query vector (residual query): no projection, just its weights.
+            return Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec());
+        }
+        // ggml weights are stored [input, output]; mul_mat reads rows of `dims[0]` inputs.
+        let cols = t.dims[0] as usize;
+        let rows = t.dims[1] as usize;
+        let rb = t.ty.row_bytes(cols);
+        ensure!(
+            raw.len() >= rows * rb,
+            "{name}: {} bytes for {rows} rows of {rb} bytes ({:?})",
+            raw.len(),
+            t.ty
+        );
+        Ok(matvec_gguf(t.ty, raw, rows, cols, x))
+    }
+
+    /// Read an F32 residual-query weight matrix as raw values (not a projection).
+    fn query(&self, name: &str) -> Result<Vec<f32>> {
+        let (_, raw) = self.tensor(name)?;
+        Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
+    }
+
+    /// Read a 1-D F32 tensor (RMSNorm weights, biases) as a vector.
+    fn f32_vec(&self, name: &str) -> Result<Vec<f32>> {
+        let (_, raw) = self.tensor(name)?;
+        Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
+    }
+
+    /// One expert's slice of a 3-D [rows, cols, experts] tensor.
+    fn expert(&self, name: &str, e: usize) -> Result<(GgmlType, &[u8], usize, usize)> {
+        let (t, raw) = self.tensor(name)?;
+        let cols = t.dims[0] as usize;
+        let rows = t.dims[1] as usize;
+        let rb = t.ty.row_bytes(cols);
+        ensure!(
+            raw.len() >= (e + 1) * rows * rb,
+            "{name}: expert {e} out of bounds ({} bytes, need {})",
+            raw.len(),
+            (e + 1) * rows * rb
+        );
+        Ok((t.ty, &raw[e * rows * rb..(e + 1) * rows * rb], rows, cols))
+    }
+
+    fn convolve(
+        &self,
+        st: &mut State,
+        slot: usize,
+        cur: &[f32],
+        weight_name: &str,
+        dynamic: Option<&[f32]>,
+        offset: usize,
+        heads: usize,
+    ) -> Result<Vec<f32>> {
+        let (_, raw) = self.tensor(weight_name)?;
+        let channels = cur.len();
+        let w: &[f32] = bytemuck::cast_slice(&raw[..self.cfg.conv * channels * 4]);
+        let hist = &mut st.conv[slot][offset..offset + (self.cfg.conv - 1) * channels];
+        Ok(convolve(
+            cur,
+            w,
+            dynamic,
+            hist,
+            channels,
+            heads,
+            self.cfg.conv,
+        ))
+    }
+
+    /// Relative-position bias: R projected onto the bias table, minus the sink logit.
+    fn rel_bias(&self, layer_name: &str, r: &[f32], sinks: &[f32]) -> Result<Vec<f32>> {
+        let (_, raw) = self.tensor(&format!("{layer_name}attn_rel_bias.weight"))?;
+        let table: &[f32] = bytemuck::cast_slice(raw);
+        let (rel_len, extent) = (self.cfg.rel_len, self.cfg.rel_extent);
+        let heads = self.cfg.n_head;
+        let mut out = vec![0.0f32; (extent + 1) * heads];
+        for d in 0..=extent {
+            for h in 0..heads {
+                let mut s = 0.0f32;
+                for i in 0..rel_len {
+                    s += table[i * extent + d.min(extent - 1)] * r[i * heads + h];
+                }
+                out[d * heads + h] = s - sinks[h];
+            }
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layer(
+        &self,
+        st: &mut State,
+        li: usize,
+        ip: usize,
+        slot: usize,
+        x: &[f32],
+        blocks: &mut Vec<Vec<f32>>,
+        message: Option<(&[f32], usize)>,
+        tau: f32,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let b = format!("blk.{li}.");
+        let hidden = cfg.hidden;
+        let is_swa = cfg.is_swa(ip);
+        let n_kv_heads = cfg.n_head_kv;
+        let kv_dim = n_kv_heads * cfg.head_dim;
+        let inp_sa = x.to_vec();
+
+        // Attention inputs: residual stream, optionally mixed with earlier blocks and
+        // merged with the previous pass's gated message.
+        let mut inputs = vec![x.to_vec(); 3];
+        let res_name = format!("{b}attn_res_query.weight");
+        if self.g.tensors.contains_key(&res_name) {
+            let q = self.query(&res_name)?;
+            let nq = q.len() / hidden;
+            let mixed = mix(blocks, x, &q, hidden, cfg.eps);
+            for (j, input) in inputs.iter_mut().enumerate() {
+                let off = if is_swa {
+                    0
+                } else {
+                    j.min(nq.saturating_sub(1))
+                } * hidden;
+                *input = mixed[off..off + hidden].to_vec();
+            }
+        }
+        if let Some((msg, phys)) = message {
+            for j in 0..3 {
+                let base = format!("blk.{phys}.loop_{}_ctrl", ["q", "k", "v"][j]);
+                let down: &[f32] =
+                    bytemuck::cast_slice(self.tensor(&format!("{base}_down.weight"))?.1);
+                let gain: &[f32] =
+                    bytemuck::cast_slice(self.tensor(&format!("{base}_gain.weight"))?.1);
+                let forget: &[f32] =
+                    bytemuck::cast_slice(self.tensor(&format!("{base}_forget.weight"))?.1);
+                let one = &msg[j * hidden..(j + 1) * hidden];
+                inputs[j] = control(&inputs[j], one, down, gain, forget, cfg);
+            }
+        }
+        let norm_name = if is_swa {
+            format!("{b}attn_norm.weight")
+        } else {
+            format!("{b}attn_q_inp_norm.weight")
+        };
+        if is_swa && message.is_some() {
+            let w = self.f32_vec(&norm_name)?;
+            for input in &mut inputs {
+                *input = rms_norm(input, &w, cfg.eps);
+            }
+        } else if is_swa {
+            let w = self.f32_vec(&norm_name)?;
+            inputs[0] = rms_norm(&inputs[0], &w, cfg.eps);
+            inputs[1] = inputs[0].clone();
+            inputs[2] = inputs[0].clone();
+        } else {
+            for (j, stream) in ["q", "k", "v"].iter().enumerate() {
+                let w = self.f32_vec(&format!("{b}attn_{stream}_inp_norm.weight"))?;
+                inputs[j] = rms_norm(&inputs[j], &w, cfg.eps);
+            }
+        }
+
+        let mut q = self.mat(&format!("{b}attn_q.weight"), &inputs[0])?;
+        let mut k = self.mat(&format!("{b}attn_k.weight"), &inputs[1])?;
+        let mut v = self.mat(&format!("{b}attn_v.weight"), &inputs[2])?;
+        let mut r = self.mat(&format!("{b}attn_rel.weight"), &inputs[0])?;
+
+        let dynamic_k = if is_swa {
+            None
+        } else {
+            Some(self.mat(&format!("{b}attn_k_conv_proj.weight"), &inputs[1])?)
+        };
+        let dynamic_v = if is_swa {
+            None
+        } else {
+            Some(self.mat(&format!("{b}attn_v_conv_proj.weight"), &inputs[2])?)
+        };
+        k = self.convolve(
+            st,
+            slot,
+            &k,
+            &format!("{b}attn_k_conv.weight"),
+            dynamic_k.as_deref(),
+            0,
+            n_kv_heads,
+        )?;
+        v = self.convolve(
+            st,
+            slot,
+            &v,
+            &format!("{b}attn_v_conv.weight"),
+            dynamic_v.as_deref(),
+            kv_dim,
+            n_kv_heads,
+        )?;
+
+        let q_clip: &[f32] =
+            bytemuck::cast_slice(self.tensor(&format!("{b}attn_q_clip.weight"))?.1);
+        let r_clip: &[f32] =
+            bytemuck::cast_slice(self.tensor(&format!("{b}attn_rel_clip.weight"))?.1);
+        q = clip(&q, cfg.head_dim, Some(q_clip), cfg.qk_clip);
+        k = clip(&k, cfg.head_dim, None, cfg.qk_clip);
+        // Per-head RMS norm of V.
+        for head in v.chunks_exact_mut(cfg.head_dim) {
+            let s: f32 = head.iter().map(|x| x * x).sum::<f32>() / cfg.head_dim as f32;
+            let scale = 1.0 / (s + cfg.eps).sqrt();
+            for x in head {
+                *x *= scale;
+            }
+        }
+        r = clip(&r, cfg.rel_len, Some(r_clip), cfg.rel_clip);
+        if !is_swa {
+            for x in q.iter_mut().chain(r.iter_mut()) {
+                *x *= tau;
+            }
+        }
+
+        let sinks = self.mat(&format!("{b}attn_sink_proj.weight"), &inputs[0])?;
+        let bias = self.rel_bias(&b, &r, &sinks)?;
+        let kv = &mut st.kv[slot];
+        kv.keys.push(k.clone());
+        kv.values.push(v.clone());
+        let start = kv.keys.len().saturating_sub(cfg.swa);
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+        let mut attn = vec![0.0f32; cfg.n_head * cfg.head_dim];
+        for h in 0..cfg.n_head {
+            let kh = h / (cfg.n_head / n_kv_heads);
+            let qh = &q[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+            let mut scores = Vec::with_capacity(kv.keys.len() - start + 1);
+            let mut vids = Vec::with_capacity(kv.keys.len() - start);
+            for (kpos, (key, val)) in kv.keys[start..].iter().zip(&kv.values[start..]).enumerate() {
+                let _ = kpos;
+                let kk = &key[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
+                let dot: f32 = qh.iter().zip(kk).map(|(a, b)| a * b).sum();
+                let d = st.pos.saturating_sub(start + kpos);
+                scores.push(dot * scale + bias[d.min(cfg.rel_extent) * cfg.n_head + h]);
+                vids.push(val);
+            }
+            scores.push(0.0); // zero sink
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let out = &mut attn[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+            for (e, val) in exps.iter().zip(vids) {
+                let w = e / sum;
+                let vv = &val[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
+                for (o, &x) in out.iter_mut().zip(vv) {
+                    *o += w * x;
+                }
+            }
+        }
+
+        let gate = self.mat(&format!("{b}attn_gate.weight"), &inputs[0])?;
+        for (a, g) in attn.iter_mut().zip(gate) {
+            *a *= 1.0 / (1.0 + (-g).exp());
+        }
+        let wo = self.mat(&format!("{b}attn_output.weight"), &attn)?;
+        let mut cur = self.convolve(
+            st,
+            slot,
+            &wo,
+            &format!("{b}attn_post_conv.weight"),
+            None,
+            2 * kv_dim,
+            cfg.hidden,
+        )?;
+
+        if ip % cfg.block == 0 {
+            blocks.push(inp_sa);
+        } else {
+            for (c, &s) in cur.iter_mut().zip(&inp_sa) {
+                *c += s;
+            }
+        }
+
+        // MoE.
+        let mut ffn_inp = cur.clone();
+        let fq = self.mat(&format!("{b}ffn_res_query.weight"), &cur)?;
+        cur = mix(blocks, &cur, &fq, hidden, cfg.eps);
+        if let Some((msg, phys)) = message {
+            let base = format!("blk.{phys}.loop_ffn_ctrl");
+            let down: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{base}_down.weight"))?.1);
+            let gain: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{base}_gain.weight"))?.1);
+            let forget: &[f32] =
+                bytemuck::cast_slice(self.tensor(&format!("{base}_forget.weight"))?.1);
+            cur = control(&cur, &msg[3 * hidden..4 * hidden], down, gain, forget, cfg);
+        }
+        let norm: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{b}ffn_norm.weight"))?.1);
+        cur = rms_norm(&cur, norm, cfg.eps);
+
+        let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &cur)?;
+        let probs: Vec<f32> = logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
+        let bias: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{b}exp_probs_b.bias"))?.1);
+        let selection: Vec<(f32, usize)> = probs
+            .iter()
+            .zip(bias)
+            .enumerate()
+            .map(|(e, (&p, &b))| (p + b, e))
+            .collect();
+        let mut selected: Vec<(f32, usize)> = selection;
+        selected.sort_by(|a, b| b.0.total_cmp(&a.0));
+        selected.truncate(cfg.n_expert_used);
+        let expert_in = cur.clone();
+        let wsum: f32 = selected.iter().map(|&(_, e)| probs[e]).sum::<f32>() + 1e-20;
+        cur = vec![0.0f32; hidden];
+        for &(_, e) in &selected {
+            let (gu_ty, gu, gu_rows, gu_cols) =
+                self.expert(&format!("{b}ffn_gate_up_exps.weight"), e)?;
+            let guv = matvec_gguf(gu_ty, gu, gu_rows, gu_cols, &expert_in);
+            let ff = gu_rows / 2;
+            let act: Vec<f32> = guv[..ff]
+                .iter()
+                .zip(&guv[ff..])
+                .map(|(&gate, &up)| {
+                    cfg.situ_beta * (gate / cfg.situ_beta).tanh() / (1.0 + (-gate).exp())
+                        * cfg.situ_lb
+                        * (up / cfg.situ_lb).tanh()
+                })
+                .collect();
+            let (dn_ty, dn, dn_rows, dn_cols) =
+                self.expert(&format!("{b}ffn_down_exps.weight"), e)?;
+            let down = matvec_gguf(dn_ty, dn, dn_rows, dn_cols, &act);
+            let w = probs[e] / wsum * cfg.expert_scale;
+            for (c, d) in cur.iter_mut().zip(down) {
+                *c += w * d;
+            }
+        }
+        let ffn_out = self.convolve(
+            st,
+            slot,
+            &cur,
+            &format!("{b}ffn_post_conv.weight"),
+            None,
+            2 * kv_dim + hidden,
+            hidden,
+        )?;
+        for (c, f) in ffn_inp.iter_mut().zip(&ffn_out) {
+            *c += f;
+        }
+        Ok(ffn_inp)
+    }
+
+    fn embedding(&self, token: u32) -> Result<Vec<f32>> {
+        let (t, raw) = self.tensor("token_embd.weight")?;
+        let cols = t.dims[0] as usize;
+        let rb = t.ty.row_bytes(cols);
+        let mut out = vec![0.0f32; cols];
+        crate::quant::dequant(
+            t.ty,
+            &raw[token as usize * rb..(token as usize + 1) * rb],
+            &mut out,
+        );
+        Ok(out)
+    }
+
+    /// Run one token through the whole network, returning unpadded logits.
+    pub fn forward(&self, st: &mut State, token: u32) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let pos = st.pos;
+        let emb = self.embedding(token)?;
+        let ln: &[f32] = bytemuck::cast_slice(self.tensor("token_embd_norm.weight")?.1);
+        let mut cur = rms_norm(&emb, ln, cfg.eps);
+
+        let tau = 1.0 + cfg.log_alpha * (((pos + 1) / cfg.log_floor).max(1) as f32).ln();
+        let mut blocks: Vec<Vec<f32>> = Vec::new();
+        for il in 0..cfg.loop_start {
+            cur = self.layer(st, il, il, il, &cur, &mut blocks, None, tau)?;
+        }
+        let prelude = cur.clone();
+        let prelude_blocks = blocks.clone();
+        for pass in 0..cfg.loop_passes {
+            let (bank, bank_out) = if pass > 0 {
+                (
+                    blocks[prelude_blocks.len() + 1..].to_vec(),
+                    Some(cur.clone()),
+                )
+            } else {
+                (Vec::new(), None)
+            };
+            if pass > 0 {
+                cur = prelude.clone();
+                blocks = prelude_blocks.clone();
+            }
+            for ip in cfg.loop_start..cfg.loop_end {
+                let phys = if pass == 0 {
+                    ip
+                } else {
+                    cfg.n_layers
+                        + (pass - 1) * (cfg.loop_end - cfg.loop_start)
+                        + (ip - cfg.loop_start)
+                };
+                let msg = if pass > 0 {
+                    let mq = self.query(&format!("blk.{ip}.loop_msg_query.weight"))?;
+                    let merged = mix(&bank, bank_out.as_ref().unwrap(), &mq, cfg.hidden, cfg.eps);
+                    Some((merged, ip))
+                } else {
+                    None
+                };
+                cur = self.layer(
+                    st,
+                    ip,
+                    ip,
+                    phys,
+                    &cur,
+                    &mut blocks,
+                    msg.as_ref().map(|(m, p)| (m.as_slice(), *p)),
+                    tau,
+                )?;
+            }
+        }
+        for il in cfg.loop_end..cfg.n_layers {
+            cur = self.layer(st, il, il, il, &cur, &mut blocks, None, tau)?;
+        }
+        let oq: &[f32] = bytemuck::cast_slice(self.tensor("output_res_query.weight")?.1);
+        cur = mix(&blocks, &cur, oq, cfg.hidden, cfg.eps);
+        let on: &[f32] = bytemuck::cast_slice(self.tensor("output_norm.weight")?.1);
+        cur = rms_norm(&cur, on, cfg.eps);
+        let logits = self.mat("output.weight", &cur)?;
+        st.pos += 1;
+        Ok(logits
+            .into_iter()
+            .take(cfg.vocab_unpadded)
+            .map(|v| {
+                if cfg.softcap != 0.0 {
+                    cfg.softcap * (v / cfg.softcap).tanh()
+                } else {
+                    v
+                }
+            })
+            .collect())
+    }
+}
+
+/// Token-by-token generation with the shared sampler. Prefill and decode both run through
+/// `forward`, so the reported decode rate includes all layer work.
+pub fn generate(
+    model: &Model,
+    st: &mut State,
+    prompt: &[u32],
+    max_new: usize,
+    temp: f32,
+    mut on_token: impl FnMut(u32),
+) -> Result<()> {
+    let mut sampler = crate::sampler::Sampler::new(crate::sampler::Params {
+        temperature: temp,
+        top_k: if temp <= 0.0 { 1 } else { 20 },
+        top_p: 0.95,
+        seed: 0x5eed,
+    });
+    let mut logits = Vec::new();
+    for &t in prompt {
+        logits = model.forward(st, t)?;
+    }
+    if std::env::var_os("INKLING2_DEBUG").is_some() {
+        let mut top: Vec<(f32, usize)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| (v, i))
+            .collect();
+        top.sort_by(|a, b| b.0.total_cmp(&a.0));
+        eprintln!("inkling2 top10: {:?}", &top[..10]);
+    }
+    for _ in 0..max_new {
+        let next = sampler.sample(&logits);
+        on_token(next);
+        logits = model.forward(st, next)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::Gguf;
     use std::path::Path;
 
     #[test]

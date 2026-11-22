@@ -18,6 +18,9 @@ pub struct Tokenizer {
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
     pre: Regex,
+    /// GPT-2 BPE with `ignore_merges`: a pre-token present verbatim in the vocab is
+    /// emitted as one token instead of being split into byte symbols and merged.
+    ignore_merges: bool,
     pub eos: u32,
 }
 
@@ -45,7 +48,10 @@ impl Tokenizer {
             bail!("unsupported tokenizer model {model}");
         }
         let pre = g.meta_str("tokenizer.ggml.pre").unwrap_or("default");
-        if pre != "qwen35" && pre != "qwen2" {
+        // inkling2 uses a GPT-2 regex pre-tokenizer; the Qwen35 regex is close enough for
+        // ordinary text, but its merges must be skipped when a piece is a vocab token.
+        let ignore_merges = pre == "inkling2";
+        if pre != "qwen35" && pre != "qwen2" && !ignore_merges {
             eprintln!("warning: pre-tokenizer {pre:?} not recognized, using qwen35 regex");
         }
         let tokens: Vec<String> = g
@@ -98,6 +104,7 @@ impl Tokenizer {
             byte_to_char,
             char_to_byte,
             pre: Regex::new(QWEN35_PRE)?,
+            ignore_merges,
             eos,
         })
     }
@@ -138,6 +145,12 @@ impl Tokenizer {
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
         for m in self.pre.find_iter(text) {
             let piece = m?.as_str();
+            if self.ignore_merges
+                && let Some(&id) = self.vocab.get(piece)
+            {
+                out.push(id);
+                continue;
+            }
             let mut syms: Vec<u32> = piece
                 .bytes()
                 .map(|b| {
