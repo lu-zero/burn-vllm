@@ -59,6 +59,23 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Whether the fused AVX2+FMA+F16C kernels can be used on this host. Everything else falls
+/// back to the portable scalar paths, so the same source builds on x86_64, aarch64, and any
+/// other target without `cfg` at the call sites.
+#[inline]
+fn avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Activation vector quantized per 32-element block to symmetric `i8` (`[-127, 127]`),
 /// plus per-block scale `d` and exact f32 block sum `bsum` (for Q5_K's `-m1 * sum(x)`).
 pub struct QuantX {
@@ -83,10 +100,8 @@ impl QuantX {
         self.d.resize(nb, 0.0);
         self.bsum.resize(nb, 0.0);
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-            && is_x86_feature_detected!("f16c")
-        {
+        if avx2_available() {
+            // SAFETY: runtime feature check above.
             unsafe {
                 avx2::quantize_into_avx2(x, &mut self.qs, &mut self.d, &mut self.bsum);
             }
@@ -125,10 +140,7 @@ impl QuantX {
 pub fn dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX, x_f32: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-            && is_x86_feature_detected!("f16c")
-        {
+        if avx2_available() {
             // SAFETY: runtime check confirmed AVX2 + FMA + F16C.
             return unsafe {
                 match ty {
@@ -146,6 +158,68 @@ pub fn dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX, x_f32: &[f32]) -> f32 {
         }
     }
     dot_scalar(ty, src, x_f32)
+}
+
+/// Fused gate+up MXFP4 dots when `fused` is set and this host has the AVX2 kernels; otherwise
+/// two portable `dot_q8` calls. Keeping the dispatch here means call sites need no `#[cfg]`,
+/// and unsupported architectures get real scalar code instead of a dead `unreachable!()`.
+#[inline]
+fn gate_up(
+    fused: bool,
+    gate_ty: GgmlType,
+    up_ty: GgmlType,
+    g_row: &[u8],
+    u_row: &[u8],
+    qx: &QuantX,
+    x: &[f32],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    if fused {
+        // SAFETY: `fused` implies an AVX2/FMA/F16C host and MXFP4 gate/up weights.
+        return unsafe { avx2::dot_mxfp4_q8_gu(g_row, u_row, qx) };
+    }
+    let _ = fused; // unused on the portable path
+    (dot_q8(gate_ty, g_row, qx, x), dot_q8(up_ty, u_row, qx, x))
+}
+
+/// 2..=4 token version of `gate_up`, writing the results into `gs`/`us`.
+#[inline]
+fn gate_up_batch(
+    fused: bool,
+    gate_ty: GgmlType,
+    up_ty: GgmlType,
+    g_row: &[u8],
+    u_row: &[u8],
+    qxs: &[&QuantX],
+    xs: &[&[f32]],
+    gs: &mut [f32],
+    us: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if fused {
+        // SAFETY: see `gate_up`.
+        unsafe { avx2::dot_mxfp4_q8_gu_batch(g_row, u_row, qxs, gs, us) };
+        return;
+    }
+    let _ = fused;
+    for i in 0..gs.len() {
+        (gs[i], us[i]) = gate_up(false, gate_ty, up_ty, g_row, u_row, qxs[i], xs[i]);
+    }
+}
+
+/// Batched Q5_K down-projection dots, with a portable scalar fallback.
+#[inline]
+fn down_batch_q5k(batch: bool, d_row: &[u8], qxs: &[&QuantX], xs: &[&[f32]], ys: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if batch {
+        // SAFETY: `batch` implies an AVX2/FMA/F16C host and Q5_K down weights.
+        unsafe { avx2::dot_q5k_q8_batch(d_row, qxs, ys) };
+        return;
+    }
+    let _ = batch;
+    for i in 0..ys.len() {
+        ys[i] = dot_q8(GgmlType::Q5K, d_row, qxs[i], xs[i]);
+    }
 }
 
 /// Exact f32 dot product (used as reference / fallback).
@@ -261,13 +335,13 @@ mod avx2 {
     use super::*;
     use std::arch::x86_64::*;
 
-    #[inline(always)]
+    #[inline]
     #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
         _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits as i32)))
     }
 
-    #[inline(always)]
+    #[inline]
     #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn hsum256_ps(v: __m256) -> f32 {
         let hi = _mm256_extractf128_ps(v, 1);
@@ -280,7 +354,7 @@ mod avx2 {
         _mm_cvtss_f32(s)
     }
 
-    #[inline(always)]
+    #[inline]
     #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn hmax256_ps(v: __m256) -> f32 {
         let hi = _mm256_extractf128_ps(v, 1);
@@ -337,7 +411,7 @@ mod avx2 {
 
     /// Signed 32 x `i8` dot product (where `a` is in `[-127, 127]` or `b` is in `[-127, 127]`):
     /// returns 8 `i32` partial sums.
-    #[inline(always)]
+    #[inline]
     #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn dot32_i8_i8(a: __m256i, b: __m256i, ones: __m256i) -> __m256i {
         let ax = _mm256_sign_epi8(a, a);
@@ -1000,18 +1074,7 @@ pub fn run_experts_cpu_decode(
         let qx0: &QuantX = qx0;
         let acts_slice = &mut acts[..m * inter];
 
-        let has_avx2 = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                is_x86_feature_detected!("avx2")
-                    && is_x86_feature_detected!("fma")
-                    && is_x86_feature_detected!("f16c")
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                false
-            }
-        };
+        let has_avx2 = avx2_available();
         let fused_mxfp4 = has_avx2 && gate_ty == GgmlType::Mxfp4 && up_ty == GgmlType::Mxfp4;
 
         MOE_POOL.install(|| {
@@ -1028,19 +1091,7 @@ pub fn run_experts_cpu_decode(
                         let job = &jobs[mi];
                         let g_row = &job.gate_raw[r * gate_row_bytes..(r + 1) * gate_row_bytes];
                         let u_row = &job.up_raw[r * up_row_bytes..(r + 1) * up_row_bytes];
-                        let (g, u) = if fused_mxfp4 {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                avx2::dot_mxfp4_q8_gu(g_row, u_row, qx0)
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            unreachable!()
-                        } else {
-                            (
-                                dot_q8(gate_ty, g_row, qx0, x0),
-                                dot_q8(up_ty, u_row, qx0, x0),
-                            )
-                        };
+                        let (g, u) = gate_up(fused_mxfp4, gate_ty, up_ty, g_row, u_row, qx0, x0);
                         *o = silu(g) * u;
                     }
                 });
@@ -1150,18 +1201,7 @@ pub fn run_experts_cpu(
         });
     }
 
-    let has_avx2 = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("fma")
-                && is_x86_feature_detected!("f16c")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    };
+    let has_avx2 = avx2_available();
     let fused_mxfp4 = has_avx2 && gate_ty == GgmlType::Mxfp4 && up_ty == GgmlType::Mxfp4;
     let batch_q5k = has_avx2 && down_ty == GgmlType::Q5K;
 
@@ -1223,28 +1263,36 @@ pub fn run_experts_cpu(
                     let np = job.pairs.len();
                     if fused_mxfp4 && np == 1 {
                         let tok = job.pairs[0].0;
-                        #[cfg(target_arch = "x86_64")]
-                        let (g, u) = unsafe { avx2::dot_mxfp4_q8_gu(g_row, u_row, &qxs_ref[tok]) };
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let (g, u) = unreachable!();
+                        let (g, u) = gate_up(
+                            fused_mxfp4,
+                            gate_ty,
+                            up_ty,
+                            g_row,
+                            u_row,
+                            &qxs_ref[tok],
+                            &x[tok * hidden..(tok + 1) * hidden],
+                        );
                         unsafe { *dst.add(off_slice[ji] + r) = silu(g) * u };
                     } else if fused_mxfp4 && (2..=4).contains(&np) {
                         let mut qptrs = [&qxs_ref[0]; 4];
+                        let mut xs: [&[f32]; 4] = [&[]; 4];
                         for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
                             qptrs[pi] = &qxs_ref[tok];
+                            xs[pi] = &x[tok * hidden..(tok + 1) * hidden];
                         }
                         let mut gs = [0.0f32; 4];
                         let mut us = [0.0f32; 4];
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            avx2::dot_mxfp4_q8_gu_batch(
-                                g_row,
-                                u_row,
-                                &qptrs[..np],
-                                &mut gs[..np],
-                                &mut us[..np],
-                            );
-                        }
+                        gate_up_batch(
+                            fused_mxfp4,
+                            gate_ty,
+                            up_ty,
+                            g_row,
+                            u_row,
+                            &qptrs[..np],
+                            &xs[..np],
+                            &mut gs[..np],
+                            &mut us[..np],
+                        );
                         for pi in 0..np {
                             unsafe {
                                 *dst.add(off_slice[ji] + pi * inter + r) = silu(gs[pi]) * us[pi];
@@ -1253,19 +1301,15 @@ pub fn run_experts_cpu(
                     } else {
                         for (pi, &(tok, _)) in job.pairs.iter().enumerate() {
                             let xt = &x[tok * hidden..(tok + 1) * hidden];
-                            let (g, u) = if fused_mxfp4 {
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    avx2::dot_mxfp4_q8_gu(g_row, u_row, &qxs_ref[tok])
-                                }
-                                #[cfg(not(target_arch = "x86_64"))]
-                                unreachable!()
-                            } else {
-                                (
-                                    dot_q8(gate_ty, g_row, &qxs_ref[tok], xt),
-                                    dot_q8(up_ty, u_row, &qxs_ref[tok], xt),
-                                )
-                            };
+                            let (g, u) = gate_up(
+                                fused_mxfp4,
+                                gate_ty,
+                                up_ty,
+                                g_row,
+                                u_row,
+                                &qxs_ref[tok],
+                                xt,
+                            );
                             unsafe { *dst.add(off_slice[ji] + pi * inter + r) = silu(g) * u };
                         }
                     }
@@ -1311,17 +1355,22 @@ pub fn run_experts_cpu(
                         let np = job.pairs.len();
                         if batch_q5k && (2..=4).contains(&np) {
                             let mut qptrs = [&qacts_ref[0]; 4];
+                            let mut acts: [&[f32]; 4] = [&[]; 4];
                             for pi in 0..np {
                                 qptrs[pi] = &qacts_ref[p0 + pi];
+                                acts[pi] = &acts_slice[(p0 + pi) * inter..(p0 + pi + 1) * inter];
                             }
                             let mut ys = [0.0f32; 4];
                             for k in 0..len {
                                 let off = (d0 + k) * down_row_bytes;
                                 let d_row = &job.down_raw[off..off + down_row_bytes];
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    avx2::dot_q5k_q8_batch(d_row, &qptrs[..np], &mut ys[..np]);
-                                }
+                                down_batch_q5k(
+                                    batch_q5k,
+                                    d_row,
+                                    &qptrs[..np],
+                                    &acts[..np],
+                                    &mut ys[..np],
+                                );
                                 for (pi, &(tok, wt)) in job.pairs.iter().enumerate() {
                                     acc[tok][k] += wt * ys[pi];
                                 }
