@@ -362,25 +362,26 @@ impl<'a> Model<'a> {
             let kv_heads = cfg.kv_heads;
             let group = cfg.heads / kv_heads;
             let mut attn = vec![0.0f32; cfg.heads * cfg.head_dim];
-            for head in 0..cfg.heads {
-                let kh = head / group;
-                let qh = &q[head * cfg.head_dim..(head + 1) * cfg.head_dim];
-                let mut scores = Vec::with_capacity(kv.keys.len() - start);
-                for key in &kv.keys[start..] {
-                    let kk = &key[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
-                    scores.push(qh.iter().zip(kk).map(|(a, b)| a * b).sum::<f32>() * scale);
-                }
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
-                let sum: f32 = exps.iter().sum();
-                let out = &mut attn[head * cfg.head_dim..(head + 1) * cfg.head_dim];
-                for (w, val) in exps.iter().zip(&kv.values[start..]) {
-                    let vv = &val[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
-                    for (o, &x) in out.iter_mut().zip(vv) {
-                        *o += w / sum * x;
+            attn.par_chunks_mut(cfg.head_dim)
+                .enumerate()
+                .for_each(|(head, out)| {
+                    let kh = head / group;
+                    let qh = &q[head * cfg.head_dim..(head + 1) * cfg.head_dim];
+                    let mut scores = Vec::with_capacity(kv.keys.len() - start);
+                    for key in &kv.keys[start..] {
+                        let kk = &key[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
+                        scores.push(qh.iter().zip(kk).map(|(a, b)| a * b).sum::<f32>() * scale);
                     }
-                }
-            }
+                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                    let sum: f32 = exps.iter().sum();
+                    for (w, val) in exps.iter().zip(&kv.values[start..]) {
+                        let vv = &val[kh * cfg.head_dim..(kh + 1) * cfg.head_dim];
+                        for (o, &x) in out.iter_mut().zip(vv) {
+                            *o += w / sum * x;
+                        }
+                    }
+                });
             let qx_attn = QuantX::from_f32(&attn);
             let a = self.mat(&format!("{b}attn_output.weight"), &attn, Some(&qx_attn))?;
             let a = rms_norm(
