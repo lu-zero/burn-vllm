@@ -102,6 +102,8 @@ impl Config {
                 "kolibri1.attention.indexer.top_k",
                 "kolibri1.attention.indexer.types",
                 "kolibri1.attention.kv_source_map",
+                "kolibri1.attention.indexer.candidate_block_size",
+                "kolibri1.attention.indexer.candidate_top_k_blocks",
                 "kolibri1.leading_dense_block_count",
             ]
             .iter()

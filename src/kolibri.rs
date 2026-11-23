@@ -79,9 +79,18 @@ pub fn validate(g: &Gguf) -> Result<()> {
         "not a kolibri1 GGUF"
     );
     // 1.1 GGUFs reuse arch="kolibri1"; refuse them by their marker KVs.
+    // Six markers, identical to the vllm.cpp U1 guard: the first three discriminate the
+    // official 1.1 file, the rest are belt-and-braces.
+    let markers = [
+        "kolibri1.attention.indexer.top_k",
+        "kolibri1.attention.indexer.types",
+        "kolibri1.attention.kv_source_map",
+        "kolibri1.attention.indexer.candidate_block_size",
+        "kolibri1.attention.indexer.candidate_top_k_blocks",
+        "kolibri1.leading_dense_block_count",
+    ];
     ensure!(
-        !g.meta.contains_key("kolibri1.attention.indexer.top_k")
-            && !g.meta.contains_key("kolibri1.attention.kv_source_map"),
+        !markers.iter().any(|k| g.meta.contains_key(*k)),
         "kolibri1_1 is not supported (GGUF reports arch kolibri1)"
     );
     let cfg = Config::from_gguf(g)?;
@@ -427,6 +436,23 @@ pub fn generate(
     let mut logits = Vec::new();
     for &t in prompt {
         logits = model.forward(st, t)?;
+    }
+    if std::env::var_os("INKLING2_DEBUG").is_some() {
+        let mut top: Vec<(f32, usize)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| (v, i))
+            .collect();
+        top.sort_by(|a, b| b.0.total_cmp(&a.0));
+        eprintln!(
+            "kolibri1 top10: {}",
+            top[..8]
+                .iter()
+                .map(|(v, i)| format!("{i}:{v:.2}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     for _ in 0..max_new {
         let next = sampler.sample(&logits);
