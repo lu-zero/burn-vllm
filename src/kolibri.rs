@@ -262,6 +262,18 @@ impl<'a> Model<'a> {
             .collect()
     }
 
+    /// Sequential row loop: used when experts themselves are scheduled in parallel.
+    fn expert_seq(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32], qx: &QuantX) -> Vec<f32> {
+        let cols = t.dims[0] as usize;
+        let rows = t.dims[1] as usize;
+        let rb = t.ty.row_bytes(cols);
+        let per = rows * rb;
+        let base = &raw[e * per..(e + 1) * per];
+        (0..rows)
+            .map(|r| dot_q8(t.ty, &base[r * rb..(r + 1) * rb], qx, x))
+            .collect()
+    }
+
     fn ensure_rope(st: &mut State, cfg: &Config, pos: usize) {
         if st.rope.len() < cfg.layers {
             st.rope.resize(cfg.layers, Vec::new());
@@ -394,24 +406,30 @@ impl<'a> Model<'a> {
                 .collect();
             selected.sort_by(|a, b| b.0.total_cmp(&a.0));
             selected.truncate(cfg.topk);
+            let (gt, gr) = self.tensor(&format!("{b}ffn_gate_exps.weight"))?;
+            let (ut, ur) = self.tensor(&format!("{b}ffn_up_exps.weight"))?;
+            let (dt, dr) = self.tensor(&format!("{b}ffn_down_exps.weight"))?;
+            let weighted: Vec<Vec<f32>> = selected
+                .par_iter()
+                .map(|&(_, e)| {
+                    let gate = Self::expert_seq(gt, gr, e, &z, &qx_z);
+                    let up = Self::expert_seq(ut, ur, e, &z, &qx_z);
+                    let act: Vec<f32> = gate
+                        .iter()
+                        .zip(&up)
+                        .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+                        .collect();
+                    let qx_act = QuantX::from_f32(&act);
+                    let down = Self::expert_seq(dt, dr, e, &act, &qx_act);
+                    // Sigmoid of the UNBIASED logit; no top-k renormalisation.
+                    let w = 1.0 / (1.0 + (-logits[e]).exp());
+                    down.into_iter().map(|d| w * d).collect()
+                })
+                .collect();
             let mut moe = vec![0.0f32; cfg.hidden];
-            for &(_, e) in &selected {
-                let (gt, gr) = self.tensor(&format!("{b}ffn_gate_exps.weight"))?;
-                let (ut, ur) = self.tensor(&format!("{b}ffn_up_exps.weight"))?;
-                let (dt, dr) = self.tensor(&format!("{b}ffn_down_exps.weight"))?;
-                let gate = Self::expert(gt, gr, e, &z, Some(&qx_z));
-                let up = Self::expert(ut, ur, e, &z, Some(&qx_z));
-                let act: Vec<f32> = gate
-                    .iter()
-                    .zip(&up)
-                    .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
-                    .collect();
-                let qx_act = QuantX::from_f32(&act);
-                let down = Self::expert(dt, dr, e, &act, Some(&qx_act));
-                // Sigmoid of the UNBIASED logit; no top-k renormalisation.
-                let w = 1.0 / (1.0 + (-logits[e]).exp());
-                for (o, d) in moe.iter_mut().zip(down) {
-                    *o += w * d;
+            for contribution in weighted {
+                for (o, d) in moe.iter_mut().zip(contribution) {
+                    *o += d;
                 }
             }
             let sg = self.mat(&format!("{b}ffn_gate_shexp.weight"), &z, Some(&qx_z))?;
