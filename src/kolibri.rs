@@ -329,9 +329,21 @@ impl<'a> Model<'a> {
             let residual = x.clone();
             let h = rms_norm(&x, &self.vec(&format!("{b}attn_norm.weight"))?, cfg.eps);
             let qx_h = QuantX::from_f32(&h);
-            let mut q = self.mat(&format!("{b}attn_q.weight"), &h, Some(&qx_h))?;
-            let mut k = self.mat(&format!("{b}attn_k.weight"), &h, Some(&qx_h))?;
-            let v = self.mat(&format!("{b}attn_v.weight"), &h, Some(&qx_h))?;
+            let qn = format!("{b}attn_q.weight");
+            let kn = format!("{b}attn_k.weight");
+            let vn = format!("{b}attn_v.weight");
+            let ((q, k), v) = rayon::join(
+                || {
+                    (
+                        self.mat(&qn, &h, Some(&qx_h)),
+                        self.mat(&kn, &h, Some(&qx_h)),
+                    )
+                },
+                || self.mat(&vn, &h, Some(&qx_h)),
+            );
+            let mut q = q?;
+            let mut k = k?;
+            let v = v?;
             // Per-head QK norm before RoPE.
             for (buf, name) in [
                 (&mut q, "attn_q_norm.weight"),
