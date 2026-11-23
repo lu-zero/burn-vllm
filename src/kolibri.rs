@@ -139,6 +139,7 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 fn matvec_f32(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
     (0..rows)
         .into_par_iter()
+        .with_min_len(16)
         .map(|r| {
             w[r * cols..(r + 1) * cols]
                 .iter()
@@ -170,6 +171,7 @@ fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32], qx: Option<&QuantX>) -> Vec<f32
     let rb = t.ty.row_bytes(cols);
     (0..rows)
         .into_par_iter()
+        .with_min_len(16)
         .map(|r| dot_q8(t.ty, &raw[r * rb..(r + 1) * rb], qx, x))
         .collect()
 }
