@@ -422,38 +422,45 @@ impl<'a> Model<'a> {
             let (gt, gr) = self.tensor(&format!("{b}ffn_gate_exps.weight"))?;
             let (ut, ur) = self.tensor(&format!("{b}ffn_up_exps.weight"))?;
             let (dt, dr) = self.tensor(&format!("{b}ffn_down_exps.weight"))?;
-            let weighted: Vec<Vec<f32>> = selected
-                .par_iter()
-                .map(|&(_, e)| {
-                    let gate = Self::expert_seq(gt, gr, e, &z, &qx_z);
-                    let up = Self::expert_seq(ut, ur, e, &z, &qx_z);
-                    let act: Vec<f32> = gate
+            let (weighted, shared) = rayon::join(
+                || {
+                    selected
+                        .par_iter()
+                        .map(|&(_, e)| {
+                            let gate = Self::expert_seq(gt, gr, e, &z, &qx_z);
+                            let up = Self::expert_seq(ut, ur, e, &z, &qx_z);
+                            let act: Vec<f32> = gate
+                                .iter()
+                                .zip(&up)
+                                .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+                                .collect();
+                            let qx_act = QuantX::from_f32(&act);
+                            let down = Self::expert_seq(dt, dr, e, &act, &qx_act);
+                            // Sigmoid of the UNBIASED logit; no top-k renormalisation.
+                            let w = 1.0 / (1.0 + (-logits[e]).exp());
+                            down.into_iter().map(|d| w * d).collect::<Vec<f32>>()
+                        })
+                        .collect::<Vec<Vec<f32>>>()
+                },
+                || -> Result<Vec<f32>> {
+                    let sg = self.mat(&format!("{b}ffn_gate_shexp.weight"), &z, Some(&qx_z))?;
+                    let su = self.mat(&format!("{b}ffn_up_shexp.weight"), &z, Some(&qx_z))?;
+                    let sa: Vec<f32> = sg
                         .iter()
-                        .zip(&up)
+                        .zip(&su)
                         .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
                         .collect();
-                    let qx_act = QuantX::from_f32(&act);
-                    let down = Self::expert_seq(dt, dr, e, &act, &qx_act);
-                    // Sigmoid of the UNBIASED logit; no top-k renormalisation.
-                    let w = 1.0 / (1.0 + (-logits[e]).exp());
-                    down.into_iter().map(|d| w * d).collect()
-                })
-                .collect();
+                    let qx_sa = QuantX::from_f32(&sa);
+                    self.mat(&format!("{b}ffn_down_shexp.weight"), &sa, Some(&qx_sa))
+                },
+            );
+            let shared = shared?;
             let mut moe = vec![0.0f32; cfg.hidden];
             for contribution in weighted {
                 for (o, d) in moe.iter_mut().zip(contribution) {
                     *o += d;
                 }
             }
-            let sg = self.mat(&format!("{b}ffn_gate_shexp.weight"), &z, Some(&qx_z))?;
-            let su = self.mat(&format!("{b}ffn_up_shexp.weight"), &z, Some(&qx_z))?;
-            let sa: Vec<f32> = sg
-                .iter()
-                .zip(&su)
-                .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
-                .collect();
-            let qx_sa = QuantX::from_f32(&sa);
-            let shared = self.mat(&format!("{b}ffn_down_shexp.weight"), &sa, Some(&qx_sa))?;
             for (o, s) in moe.iter_mut().zip(shared) {
                 *o += s;
             }
