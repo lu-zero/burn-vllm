@@ -150,18 +150,27 @@ fn matvec_f32(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
 }
 
 /// GGML 2-D weights are [input, output]; `rows` is the output dimension.
-fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32]) -> Vec<f32> {
+/// `qx` is the activation quantization, computed once per input vector and reused across
+/// all matvecs that read it (q/k/v, router, every selected expert and the shared expert).
+fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32], qx: Option<&QuantX>) -> Vec<f32> {
     let cols = t.dims[0] as usize;
     let rows = t.dims[1] as usize;
     if t.ty == GgmlType::F32 {
         let w: &[f32] = bytemuck::cast_slice(&raw[..rows * cols * 4]);
         return matvec_f32(w, rows, cols, x);
     }
-    let qx = QuantX::from_f32(x);
+    let owned;
+    let qx = match qx {
+        Some(q) => q,
+        None => {
+            owned = QuantX::from_f32(x);
+            &owned
+        }
+    };
     let rb = t.ty.row_bytes(cols);
     (0..rows)
         .into_par_iter()
-        .map(|r| dot_q8(t.ty, &raw[r * rb..(r + 1) * rb], &qx, x))
+        .map(|r| dot_q8(t.ty, &raw[r * rb..(r + 1) * rb], qx, x))
         .collect()
 }
 
@@ -219,9 +228,9 @@ impl<'a> Model<'a> {
         Ok((t, self.g.bytes(t)))
     }
 
-    fn mat(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+    fn mat(&self, name: &str, x: &[f32], qx: Option<&QuantX>) -> Result<Vec<f32>> {
         let (t, raw) = self.tensor(name)?;
-        Ok(matvec(t, raw, x))
+        Ok(matvec(t, raw, x, qx))
     }
 
     fn vec(&self, name: &str) -> Result<Vec<f32>> {
@@ -229,7 +238,7 @@ impl<'a> Model<'a> {
         Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
     }
 
-    fn expert(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32]) -> Vec<f32> {
+    fn expert(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32], qx: Option<&QuantX>) -> Vec<f32> {
         let cols = t.dims[0] as usize;
         let rows = t.dims[1] as usize;
         if t.ty == GgmlType::F32 {
@@ -239,7 +248,14 @@ impl<'a> Model<'a> {
         }
         let rb = t.ty.row_bytes(cols);
         let per = rows * rb;
-        let qx = QuantX::from_f32(x);
+        let owned;
+        let qx = match qx {
+            Some(q) => q,
+            None => {
+                owned = QuantX::from_f32(x);
+                &owned
+            }
+        };
         (0..rows)
             .into_par_iter()
             .map(|r| dot_q8(t.ty, &raw[e * per + r * rb..e * per + (r + 1) * rb], &qx, x))
@@ -300,9 +316,10 @@ impl<'a> Model<'a> {
             let b = format!("blk.{il}.");
             let residual = x.clone();
             let h = rms_norm(&x, &self.vec(&format!("{b}attn_norm.weight"))?, cfg.eps);
-            let mut q = self.mat(&format!("{b}attn_q.weight"), &h)?;
-            let mut k = self.mat(&format!("{b}attn_k.weight"), &h)?;
-            let v = self.mat(&format!("{b}attn_v.weight"), &h)?;
+            let qx_h = QuantX::from_f32(&h);
+            let mut q = self.mat(&format!("{b}attn_q.weight"), &h, Some(&qx_h))?;
+            let mut k = self.mat(&format!("{b}attn_k.weight"), &h, Some(&qx_h))?;
+            let v = self.mat(&format!("{b}attn_v.weight"), &h, Some(&qx_h))?;
             // Per-head QK norm before RoPE.
             for (buf, name) in [
                 (&mut q, "attn_q_norm.weight"),
@@ -352,7 +369,8 @@ impl<'a> Model<'a> {
                     }
                 }
             }
-            let a = self.mat(&format!("{b}attn_output.weight"), &attn)?;
+            let qx_attn = QuantX::from_f32(&attn);
+            let a = self.mat(&format!("{b}attn_output.weight"), &attn, Some(&qx_attn))?;
             let a = rms_norm(
                 &a,
                 &self.vec(&format!("{b}post_attention_norm.weight"))?,
@@ -365,7 +383,8 @@ impl<'a> Model<'a> {
                 cfg.eps,
             );
 
-            let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &z)?;
+            let qx_z = QuantX::from_f32(&z);
+            let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &z, Some(&qx_z))?;
             let bias = self.vec(&format!("{b}exp_probs_b.bias"))?;
             let mut selected: Vec<(f32, usize)> = logits
                 .iter()
@@ -380,28 +399,30 @@ impl<'a> Model<'a> {
                 let (gt, gr) = self.tensor(&format!("{b}ffn_gate_exps.weight"))?;
                 let (ut, ur) = self.tensor(&format!("{b}ffn_up_exps.weight"))?;
                 let (dt, dr) = self.tensor(&format!("{b}ffn_down_exps.weight"))?;
-                let gate = Self::expert(gt, gr, e, &z);
-                let up = Self::expert(ut, ur, e, &z);
+                let gate = Self::expert(gt, gr, e, &z, Some(&qx_z));
+                let up = Self::expert(ut, ur, e, &z, Some(&qx_z));
                 let act: Vec<f32> = gate
                     .iter()
                     .zip(&up)
                     .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
                     .collect();
-                let down = Self::expert(dt, dr, e, &act);
+                let qx_act = QuantX::from_f32(&act);
+                let down = Self::expert(dt, dr, e, &act, Some(&qx_act));
                 // Sigmoid of the UNBIASED logit; no top-k renormalisation.
                 let w = 1.0 / (1.0 + (-logits[e]).exp());
                 for (o, d) in moe.iter_mut().zip(down) {
                     *o += w * d;
                 }
             }
-            let sg = self.mat(&format!("{b}ffn_gate_shexp.weight"), &z)?;
-            let su = self.mat(&format!("{b}ffn_up_shexp.weight"), &z)?;
+            let sg = self.mat(&format!("{b}ffn_gate_shexp.weight"), &z, Some(&qx_z))?;
+            let su = self.mat(&format!("{b}ffn_up_shexp.weight"), &z, Some(&qx_z))?;
             let sa: Vec<f32> = sg
                 .iter()
                 .zip(&su)
                 .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
                 .collect();
-            let shared = self.mat(&format!("{b}ffn_down_shexp.weight"), &sa)?;
+            let qx_sa = QuantX::from_f32(&sa);
+            let shared = self.mat(&format!("{b}ffn_down_shexp.weight"), &sa, Some(&qx_sa))?;
             for (o, s) in moe.iter_mut().zip(shared) {
                 *o += s;
             }
@@ -413,7 +434,8 @@ impl<'a> Model<'a> {
             x = ffn_inp.iter().zip(&out).map(|(f, o)| f + o).collect();
         }
         let norm = rms_norm(&x, &self.vec("output_norm.weight")?, cfg.eps);
-        let logits = self.mat("output.weight", &norm)?;
+        let qx_norm = QuantX::from_f32(&norm);
+        let logits = self.mat("output.weight", &norm, Some(&qx_norm))?;
         st.pos += 1;
         Ok(logits.into_iter().take(cfg.vocab).collect())
     }
