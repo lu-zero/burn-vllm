@@ -264,6 +264,36 @@ impl<'a> Model<'a> {
             .collect()
     }
 
+    /// Three projections in one parallel loop: q/k/v row work is dispatched once instead of
+    /// three times, which cuts the per-invocation rayon epoch overhead.
+    fn matvec3(ws: [(&TensorInfo, &[u8]); 3], x: &[f32], qx: &QuantX) -> [Vec<f32>; 3] {
+        let rows: Vec<usize> = ws.iter().map(|(t, _)| t.dims[1] as usize).collect();
+        let mut flat = vec![0.0f32; rows.iter().sum()];
+        flat.par_iter_mut()
+            .enumerate()
+            .with_min_len(16)
+            .for_each(|(idx, dst)| {
+                let (wi, row) = if idx < rows[0] {
+                    (0, idx)
+                } else if idx < rows[0] + rows[1] {
+                    (1, idx - rows[0])
+                } else {
+                    (2, idx - rows[0] - rows[1])
+                };
+                let (t, raw) = ws[wi];
+                let cols = t.dims[0] as usize;
+                let rb = t.ty.row_bytes(cols);
+                *dst = dot_q8(t.ty, &raw[row * rb..(row + 1) * rb], qx, x);
+            });
+        let mut out = Vec::with_capacity(3);
+        let mut off = 0;
+        for r in rows {
+            out.push(flat[off..off + r].to_vec());
+            off += r;
+        }
+        [out.remove(0), out.remove(0), out.remove(0)]
+    }
+
     /// Sequential row loop: used when experts themselves are scheduled in parallel.
     fn expert_seq(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32], qx: &QuantX) -> Vec<f32> {
         let cols = t.dims[0] as usize;
@@ -331,21 +361,10 @@ impl<'a> Model<'a> {
             let residual = x.clone();
             let h = rms_norm(&x, &self.vec(&format!("{b}attn_norm.weight"))?, cfg.eps);
             let qx_h = QuantX::from_f32(&h);
-            let qn = format!("{b}attn_q.weight");
-            let kn = format!("{b}attn_k.weight");
-            let vn = format!("{b}attn_v.weight");
-            let ((q, k), v) = rayon::join(
-                || {
-                    (
-                        self.mat(&qn, &h, Some(&qx_h)),
-                        self.mat(&kn, &h, Some(&qx_h)),
-                    )
-                },
-                || self.mat(&vn, &h, Some(&qx_h)),
-            );
-            let mut q = q?;
-            let mut k = k?;
-            let v = v?;
+            let (qt, qr) = self.tensor(&format!("{b}attn_q.weight"))?;
+            let (kt, kr) = self.tensor(&format!("{b}attn_k.weight"))?;
+            let (vt, vr) = self.tensor(&format!("{b}attn_v.weight"))?;
+            let [mut q, mut k, v] = Self::matvec3([(qt, qr), (kt, kr), (vt, vr)], &h, &qx_h);
             // Per-head QK norm before RoPE.
             for (buf, name) in [
                 (&mut q, "attn_q_norm.weight"),
