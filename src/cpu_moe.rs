@@ -255,6 +255,7 @@ pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> 
         GgmlType::Q4K => neon::dot_q4k_q8(src, qx),
         GgmlType::Q3K => neon::dot_q3k_q8(src, qx),
         GgmlType::Q8_0 => neon::dot_q8_0_q8(src, qx),
+        GgmlType::Q5_1 => neon::dot_q5_1_q8(src, qx),
         _ => None,
     }
 }
@@ -1554,6 +1555,14 @@ mod neon {
         Some(unsafe { dot_q8_0_q8_dotprod(src, qx) })
     }
 
+    /// Q5_1 blocks (24 bytes: f16 d/m, 4 high-bit bytes, 16 packed low nibbles).
+    pub fn dot_q5_1_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q5_1_q8_dotprod(src, qx) })
+    }
+
     /// Q3_K superblocks (110 bytes).
     pub fn dot_q3k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
         if !dotprod_available() {
@@ -1586,6 +1595,69 @@ mod neon {
                 qp = qp.add(32);
             }
             sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q5_1_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 24);
+            let lo4 = vdupq_n_u8(0x0F);
+            let one = vdupq_n_u8(1);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            let bp = qx.bsum.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 24);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(bi);
+                let m = f16::from_le_bytes([*p.add(2), *p.add(3)]).to_f32();
+                let qs = p.add(8);
+                let qh = p.add(4);
+
+                // Expand each packed byte into [low nibble, high nibble].
+                let raw = vld1q_u8(qs);
+                let nib = vandq_u8(raw, lo4);
+                let hib = vshrq_n_u8(raw, 4);
+                let w0 = vzip1q_u8(nib, hib);
+                let w1 = vzip2q_u8(nib, hib);
+
+                // High bit j/8 from the four qh bytes; bit position j%8 per lane.
+                let mut hb = [0u8; 16];
+                let mut hs = [0i8; 16];
+                for i in 0..8 {
+                    hb[i] = *qh;
+                    hb[8 + i] = *qh.add(1);
+                    hs[i] = -(i as i8);
+                    hs[8 + i] = -(i as i8);
+                }
+                let high0 = vshlq_n_u8(
+                    vandq_u8(vshlq_u8(vld1q_u8(hb.as_ptr()), vld1q_s8(hs.as_ptr())), one),
+                    4,
+                );
+                hb[..8].copy_from_slice(&[*qh.add(2); 8]);
+                hb[8..].copy_from_slice(&[*qh.add(3); 8]);
+                let high1 = vshlq_n_u8(
+                    vandq_u8(vshlq_u8(vld1q_u8(hb.as_ptr()), vld1q_s8(hs.as_ptr())), one),
+                    4,
+                );
+
+                let v0 = vorrq_u8(w0, high0);
+                let v1 = vorrq_u8(w1, high1);
+                let dot0 = vaddvq_s32(vdotq_s32(zero, vreinterpretq_s8_u8(v0), vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vreinterpretq_s8_u8(v1),
+                    vld1q_s8(qp.add(16)),
+                ));
+                sum += d * ((dot0 + dot1) as f32);
+                min_acc += m * *bp.add(bi);
+                qp = qp.add(32);
+            }
+            sum - min_acc
         }
     }
 
@@ -1954,6 +2026,38 @@ mod neon {
                 sum += d * dot as f32;
             }
             sum
+        }
+
+        fn q5_1_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            for bi in 0..qx.d.len() {
+                let p = &src[bi * 24..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[bi];
+                let m = f16::from_le_bytes([p[2], p[3]]).to_f32();
+                let mut dot = 0i32;
+                for j in 0..32 {
+                    let lo = ((p[8 + j / 2] >> (4 * (j % 2))) & 0xF) as i32;
+                    let hi = (((p[4 + j / 8] >> (j % 8)) & 1) << 4) as i32;
+                    dot += (lo | hi) * qx.qs[bi * 32 + j] as i32;
+                }
+                sum += d * dot as f32;
+                min_acc += m * qx.bsum[bi];
+            }
+            sum - min_acc
+        }
+
+        #[test]
+        fn q5_1_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q5_1, 4);
+            assert_close(
+                GgmlType::Q5_1,
+                dot_q5_1_q8(&src, &qx),
+                q5_1_ordered(&src, &qx),
+            );
         }
 
         fn q5k_ordered(src: &[u8], qx: &QuantX) -> f32 {
