@@ -256,6 +256,8 @@ pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> 
         GgmlType::Q3K => neon::dot_q3k_q8(src, qx),
         GgmlType::Q8_0 => neon::dot_q8_0_q8(src, qx),
         GgmlType::Q5_1 => neon::dot_q5_1_q8(src, qx),
+        GgmlType::Iq4Nl => neon::dot_iq4nl_q8(src, qx),
+        GgmlType::Nvfp4 => neon::dot_nvfp4_q8(src, qx),
         _ => None,
     }
 }
@@ -1555,6 +1557,22 @@ mod neon {
         Some(unsafe { dot_q8_0_q8_dotprod(src, qx) })
     }
 
+    /// IQ4_NL blocks (18 bytes: f16 d + 16 packed nibbles from a 16-entry table).
+    pub fn dot_iq4nl_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq4nl_q8_dotprod(src, qx) })
+    }
+
+    /// NVFP4 blocks (36 bytes: four E4M3 scales + four 8-byte nibble groups).
+    pub fn dot_nvfp4_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_nvfp4_q8_dotprod(src, qx) })
+    }
+
     /// Q5_1 blocks (24 bytes: f16 d/m, 4 high-bit bytes, 16 packed low nibbles).
     pub fn dot_q5_1_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
         if !dotprod_available() {
@@ -1593,6 +1611,65 @@ mod neon {
                 let dot1 = vaddvq_s32(vdotq_s32(zero, w1, vld1q_s8(qp.add(16))));
                 sum += d * ((dot0 + dot1) as f32);
                 qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq4nl_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 18);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            let table = vld1q_s8(crate::quant::KVALUES_IQ4NL.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 18);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(bi);
+                let raw = vld1q_u8(p.add(2));
+                let w0 = vqtbl1q_s8(table, vandq_u8(raw, lo4));
+                let w1 = vqtbl1q_s8(table, vshrq_n_u8(raw, 4));
+                let dot0 = vaddvq_s32(vdotq_s32(zero, w0, vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(zero, w1, vld1q_s8(qp.add(16))));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_nvfp4_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 64;
+            debug_assert!(src.len() >= nb * 36);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            let table = vld1q_s8(MXFP4_VALUES.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 36);
+                for s in 0..4usize {
+                    let d = crate::quant::ue4m3_half(*p.add(s)) * *dp.add(bi * 2 + s / 2);
+                    // A sub-block is only 8 packed bytes: low nibbles give values 0..8,
+                    // high nibbles give 8..16. Interleave them into one 16-byte index vector.
+                    let raw8 = vld1_u8(p.add(4 + 8 * s));
+                    let raw = vcombine_u8(raw8, raw8);
+                    let idx = vcombine_u8(
+                        vget_low_u8(vandq_u8(raw, lo4)),
+                        vget_low_u8(vshrq_n_u8(raw, 4)),
+                    );
+                    let w = vqtbl1q_s8(table, idx);
+                    let dot = vaddvq_s32(vdotq_s32(zero, w, vld1q_s8(qp)));
+                    sum += d * (dot as f32);
+                    qp = qp.add(16);
+                }
             }
             sum
         }
@@ -2026,6 +2103,53 @@ mod neon {
                 sum += d * dot as f32;
             }
             sum
+        }
+
+        #[test]
+        fn iq4nl_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq4Nl, 4);
+            let mut expected = 0.0f32;
+            for bi in 0..qx.d.len() {
+                let p = &src[bi * 18..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[bi];
+                let mut dot = 0i32;
+                for j in 0..16 {
+                    dot += crate::quant::KVALUES_IQ4NL[(p[2 + j] & 0xF) as usize] as i32
+                        * qx.qs[bi * 32 + j] as i32;
+                    dot += crate::quant::KVALUES_IQ4NL[(p[2 + j] >> 4) as usize] as i32
+                        * qx.qs[bi * 32 + 16 + j] as i32;
+                }
+                expected += d * dot as f32;
+            }
+            assert_close(GgmlType::Iq4Nl, dot_iq4nl_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn nvfp4_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Nvfp4, 4);
+            let mut expected = 0.0f32;
+            for bi in 0..qx.d.len() / 2 {
+                let p = &src[bi * 36..];
+                for s in 0..4 {
+                    let d = crate::quant::ue4m3_half(p[s]) * qx.d[bi * 2 + s / 2];
+                    let mut dot = 0i32;
+                    for j in 0..8 {
+                        let b = p[4 + 8 * s + j];
+                        dot += MXFP4_VALUES[(b & 0xF) as usize] as i32
+                            * qx.qs[bi * 64 + 16 * s + j] as i32;
+                        dot += MXFP4_VALUES[(b >> 4) as usize] as i32
+                            * qx.qs[bi * 64 + 16 * s + 8 + j] as i32;
+                    }
+                    expected += d * dot as f32;
+                }
+            }
+            assert_close(GgmlType::Nvfp4, dot_nvfp4_q8(&src, &qx), expected);
         }
 
         fn q5_1_ordered(src: &[u8], qx: &QuantX) -> f32 {
