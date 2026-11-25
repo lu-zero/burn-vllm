@@ -190,6 +190,62 @@ pub(crate) fn neon_available() -> bool {
     neon::dotprod_available()
 }
 
+/// NEON activation quantization: exact scalar block sum (kept in order for parity), SIMD
+/// amax/round/pack. `vcvtaq_s32_f32` rounds ties away from zero like `f32::round`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn neon_quantize_into(x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let nb = x.len() / 32;
+        let clamp_lo = vdupq_n_s32(-127);
+        for bi in 0..nb {
+            let p = x.as_ptr().add(bi * 32);
+            // Keep the scalar summation order: bsum feeds the K-quant min correction.
+            let mut sum = 0.0f32;
+            for &v in &x[bi * 32..(bi + 1) * 32] {
+                sum += v;
+            }
+            bsum[bi] = sum;
+
+            let v0 = vabsq_f32(vld1q_f32(p));
+            let v1 = vabsq_f32(vld1q_f32(p.add(4)));
+            let v2 = vabsq_f32(vld1q_f32(p.add(8)));
+            let v3 = vabsq_f32(vld1q_f32(p.add(12)));
+            let v4 = vabsq_f32(vld1q_f32(p.add(16)));
+            let v5 = vabsq_f32(vld1q_f32(p.add(20)));
+            let v6 = vabsq_f32(vld1q_f32(p.add(24)));
+            let v7 = vabsq_f32(vld1q_f32(p.add(28)));
+            let amax = vmaxvq_f32(vmaxq_f32(
+                vmaxq_f32(vmaxq_f32(v0, v1), vmaxq_f32(v2, v3)),
+                vmaxq_f32(vmaxq_f32(v4, v5), vmaxq_f32(v6, v7)),
+            ));
+            let scale = amax / 127.0;
+            d[bi] = scale;
+            let inv = vdupq_n_f32(if scale > 0.0 { 1.0 / scale } else { 0.0 });
+
+            let i0 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p), inv));
+            let i1 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(4)), inv));
+            let i2 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(8)), inv));
+            let i3 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(12)), inv));
+            let i4 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(16)), inv));
+            let i5 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(20)), inv));
+            let i6 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(24)), inv));
+            let i7 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(28)), inv));
+            let pack4 = |a: int32x4_t, b: int32x4_t| {
+                vqmovn_s16(vcombine_s16(
+                    vqmovn_s32(vmaxq_s32(a, clamp_lo)),
+                    vqmovn_s32(vmaxq_s32(b, clamp_lo)),
+                ))
+            };
+            let bytes0 = vcombine_s8(pack4(i0, i1), pack4(i2, i3));
+            let bytes1 = vcombine_s8(pack4(i4, i5), pack4(i6, i7));
+            let dst = qs.as_mut_ptr().add(bi * 32);
+            vst1q_s8(dst, bytes0);
+            vst1q_s8(dst.add(16), bytes1);
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
     match ty {

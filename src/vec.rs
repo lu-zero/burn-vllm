@@ -21,6 +21,15 @@ pub trait VecBackend: Send + Sync {
 
     /// Per-32-block symmetric i8 quantization: scales, exact block sums and codes.
     fn quantize_into(&self, x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]);
+
+    /// RMS norm. The reduction stays in scalar order (so results are bit-identical);
+    /// only the elementwise scale is vectorized.
+    fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32>;
+}
+
+fn rms_scale(x: &[f32], eps: f32) -> f32 {
+    let sum: f32 = x.iter().map(|v| v * v).sum();
+    1.0 / (sum / x.len() as f32 + eps).sqrt()
 }
 
 struct Scalar;
@@ -32,6 +41,11 @@ impl VecBackend for Scalar {
 
     fn dot_q8(&self, ty: GgmlType, src: &[u8], _qx: &QuantX, x: &[f32]) -> f32 {
         crate::cpu_moe::dot_scalar(ty, src, x)
+    }
+
+    fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+        let scale = rms_scale(x, eps);
+        x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
     }
 
     fn quantize_into(&self, x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
@@ -56,6 +70,47 @@ impl VecBackend for Scalar {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn rms_elements(x: &[f32], w: &[f32], out: &mut [f32], scale: f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let vs = vdupq_n_f32(scale);
+        let chunks = x.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            let v = vmulq_f32(vld1q_f32(x[i..].as_ptr()), vs);
+            let o = vmulq_f32(v, vld1q_f32(w[i..].as_ptr()));
+            vst1q_f32(out[i..].as_mut_ptr(), o);
+        }
+    }
+    for i in x.len() / 4 * 4..x.len() {
+        out[i] = x[i] * scale * w[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rms_elements(x: &[f32], w: &[f32], out: &mut [f32], scale: f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let vs = _mm_set1_ps(scale);
+        let chunks = x.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            let v = _mm_mul_ps(_mm_loadu_ps(x[i..].as_ptr()), vs);
+            let o = _mm_mul_ps(v, _mm_loadu_ps(w[i..].as_ptr()));
+            _mm_storeu_ps(out[i..].as_mut_ptr(), o);
+        }
+    }
+    for i in x.len() / 4 * 4..x.len() {
+        out[i] = x[i] * scale * w[i];
+    }
+}
+
+fn rms_norm_vectorized(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let scale = rms_scale(x, eps);
+    let mut out = vec![0.0f32; x.len()];
+    rms_elements(x, w, &mut out, scale);
+    out
+}
+
 #[cfg(target_arch = "x86_64")]
 struct Avx2;
 
@@ -74,6 +129,10 @@ impl VecBackend for Avx2 {
         // SAFETY: selected only on an AVX2+FMA+F16C host.
         unsafe { crate::cpu_moe::avx2_quantize_into(x, qs, d, bsum) }
     }
+
+    fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+        rms_norm_vectorized(x, w, eps)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -90,7 +149,12 @@ impl VecBackend for Neon {
     }
 
     fn quantize_into(&self, x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
-        Scalar.quantize_into(x, qs, d, bsum)
+        // SAFETY: NEON is baseline on aarch64 and this impl is aarch64-only.
+        unsafe { crate::cpu_moe::neon_quantize_into(x, qs, d, bsum) }
+    }
+
+    fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+        rms_norm_vectorized(x, w, eps)
     }
 }
 
@@ -130,6 +194,45 @@ mod tests {
     #[test]
     fn backend_is_selected() {
         assert!(!backend().name().is_empty());
+    }
+
+    #[test]
+    fn backend_rms_norm_matches_scalar_bit_exactly() {
+        let x: Vec<f32> = (0..1025)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.125)
+            .collect();
+        let w: Vec<f32> = (0..1025).map(|i| 0.5 + ((i % 11) as f32) * 0.05).collect();
+        let expected = Scalar.rms_norm(&x, &w, 1e-5);
+        let got = backend().rms_norm(&x, &w, 1e-5);
+        assert_eq!(got.len(), expected.len());
+        for (a, b) in got.iter().zip(&expected) {
+            assert_eq!(a.to_bits(), b.to_bits(), "rms_norm output differs");
+        }
+    }
+
+    #[test]
+    fn backend_quantization_matches_scalar_bit_exactly() {
+        let x: Vec<f32> = (0..512)
+            .map(|i| {
+                let s = (i as f32) * 0.017;
+                s.sin() * 3.0 + ((i % 13) as f32) * 0.25
+            })
+            .collect();
+        let mut expected = QuantX::new();
+        expected.qs.resize(512, 0);
+        expected.d.resize(16, 0.0);
+        expected.bsum.resize(16, 0.0);
+        Scalar.quantize_into(&x, &mut expected.qs, &mut expected.d, &mut expected.bsum);
+
+        let mut got = QuantX::new();
+        got.qs.resize(512, 0);
+        got.d.resize(16, 0.0);
+        got.bsum.resize(16, 0.0);
+        backend().quantize_into(&x, &mut got.qs, &mut got.d, &mut got.bsum);
+
+        assert_eq!(got.qs, expected.qs, "quantized codes differ");
+        assert_eq!(got.d, expected.d, "scales differ");
+        assert_eq!(got.bsum, expected.bsum, "block sums differ");
     }
 
     #[test]
