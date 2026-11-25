@@ -13,6 +13,7 @@ mod selftest;
 mod server;
 mod threads;
 mod tokenizer;
+mod vec;
 
 use anyhow::{Result, bail};
 use burn_cubecl::cubecl;
