@@ -139,3 +139,22 @@ pub fn run(gguf: &Gguf, path: &std::path::Path, limit: usize) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_softmax_matches_reference() {
+        let logits = [2.0f32, 1.0, 0.1, -3.0];
+        let got = log_softmax(&logits);
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denom: f64 = logits.iter().map(|&v| (f64::from(v - max)).exp()).sum();
+        for (&v, &g) in logits.iter().zip(&got) {
+            let want = f64::from(v - max) - denom.ln();
+            assert!((f64::from(g) - want).abs() < 1e-5, "got {g}, want {want}");
+        }
+        let sum: f32 = got.iter().map(|v| v.exp()).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "probabilities sum to {sum}");
+    }
+}
