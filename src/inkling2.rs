@@ -201,18 +201,15 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// Clip each row (head) of `x` to L2 norm <= threshold, after optional per-channel scale.
 fn clip(x: &[f32], width: usize, scale: Option<&[f32]>, threshold: f32) -> Vec<f32> {
     let mut out = x.to_vec();
+    let backend = crate::vec::backend();
     if let Some(s) = scale {
-        for (v, &c) in out.iter_mut().zip(s) {
-            *v *= c;
-        }
+        backend.mul_inplace(&mut out, s);
     }
     for row in out.chunks_exact_mut(width) {
         // llama.cpp: sqrt(sum_rows(sqr(x))) then scale_bias(+1e-6), i.e. sqrt(sum) + eps.
         let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-6;
         let factor = (threshold / norm).min(1.0).max(0.0);
-        for v in row {
-            *v *= factor;
-        }
+        backend.mul_scalar(row, factor);
     }
     out
 }

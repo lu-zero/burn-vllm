@@ -25,6 +25,33 @@ pub trait VecBackend: Send + Sync {
     /// RMS norm. The reduction stays in scalar order (so results are bit-identical);
     /// only the elementwise scale is vectorized.
     fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32>;
+
+    /// Index of the last maximum (matching `Iterator::max_by(total_cmp)`).
+    fn argmax(&self, x: &[f32]) -> usize {
+        let mut best = f32::NEG_INFINITY;
+        let mut idx = 0;
+        for (i, &v) in x.iter().enumerate() {
+            if v >= best {
+                best = v;
+                idx = i;
+            }
+        }
+        idx
+    }
+
+    /// `dst[i] *= scale[i]`.
+    fn mul_inplace(&self, dst: &mut [f32], scale: &[f32]) {
+        for (d, &s) in dst.iter_mut().zip(scale) {
+            *d *= s;
+        }
+    }
+
+    /// `dst[i] *= factor`.
+    fn mul_scalar(&self, dst: &mut [f32], factor: f32) {
+        for d in dst {
+            *d *= factor;
+        }
+    }
 }
 
 fn rms_scale(x: &[f32], eps: f32) -> f32 {
@@ -67,6 +94,63 @@ impl VecBackend for Scalar {
                 *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
             }
         }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn argmax_neon(x: &[f32]) -> usize {
+    use std::arch::aarch64::*;
+    if x.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+        let chunks = x.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            vmax = vmaxq_f32(vmax, vld1q_f32(x[i..].as_ptr()));
+        }
+        let mut best = vmaxvq_f32(vmax);
+        for &v in &x[chunks..] {
+            best = best.max(v);
+        }
+        // `max_by` keeps the last maximum; scan backwards to match it exactly.
+        for i in (0..x.len()).rev() {
+            if x[i] == best {
+                return i;
+            }
+        }
+        0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mul_inplace_neon(dst: &mut [f32], scale: &[f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let chunks = dst.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            let v = vmulq_f32(vld1q_f32(dst[i..].as_ptr()), vld1q_f32(scale[i..].as_ptr()));
+            vst1q_f32(dst[i..].as_mut_ptr(), v);
+        }
+    }
+    for i in dst.len() / 4 * 4..dst.len() {
+        dst[i] *= scale[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mul_scalar_neon(dst: &mut [f32], factor: f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let vs = vdupq_n_f32(factor);
+        let chunks = dst.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            let v = vmulq_f32(vld1q_f32(dst[i..].as_ptr()), vs);
+            vst1q_f32(dst[i..].as_mut_ptr(), v);
+        }
+    }
+    for i in dst.len() / 4 * 4..dst.len() {
+        dst[i] *= factor;
     }
 }
 
@@ -156,6 +240,18 @@ impl VecBackend for Neon {
     fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
         rms_norm_vectorized(x, w, eps)
     }
+
+    fn argmax(&self, x: &[f32]) -> usize {
+        argmax_neon(x)
+    }
+
+    fn mul_inplace(&self, dst: &mut [f32], scale: &[f32]) {
+        mul_inplace_neon(dst, scale)
+    }
+
+    fn mul_scalar(&self, dst: &mut [f32], factor: f32) {
+        mul_scalar_neon(dst, factor)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -194,6 +290,31 @@ mod tests {
     #[test]
     fn backend_is_selected() {
         assert!(!backend().name().is_empty());
+    }
+
+    #[test]
+    fn backend_elementwise_matches_scalar() {
+        let x: Vec<f32> = (0..1030).map(|i| (i % 29) as f32 * 0.25 - 3.0).collect();
+        let scale: Vec<f32> = (0..1030).map(|i| 1.0 + (i % 7) as f32 * 0.1).collect();
+        let mut expected = x.clone();
+        Scalar.mul_inplace(&mut expected, &scale);
+        Scalar.mul_scalar(&mut expected, 0.75);
+        let mut got = x.clone();
+        backend().mul_inplace(&mut got, &scale);
+        backend().mul_scalar(&mut got, 0.75);
+        for (a, b) in got.iter().zip(&expected) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        let mut vals = vec![0.0f32; 2050];
+        for (i, v) in vals.iter_mut().enumerate() {
+            *v = (i % 31) as f32;
+        }
+        vals[2049] = 31.0;
+        vals[7] = 31.0; // duplicate maximum: `max_by` keeps the last one
+        let expected = Scalar.argmax(&vals);
+        assert_eq!(backend().argmax(&vals), expected);
+        assert_eq!(expected, 2049);
     }
 
     #[test]
