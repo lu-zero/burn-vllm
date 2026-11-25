@@ -63,7 +63,7 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 /// back to the portable scalar paths, so the same source builds on x86_64, aarch64, and any
 /// other target without `cfg` at the call sites.
 #[inline]
-fn avx2_available() -> bool {
+pub(crate) fn avx2_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         is_x86_feature_detected!("avx2")
@@ -99,33 +99,7 @@ impl QuantX {
         self.qs.resize(x.len(), 0);
         self.d.resize(nb, 0.0);
         self.bsum.resize(nb, 0.0);
-        #[cfg(target_arch = "x86_64")]
-        if avx2_available() {
-            // SAFETY: runtime feature check above.
-            unsafe {
-                avx2::quantize_into_avx2(x, &mut self.qs, &mut self.d, &mut self.bsum);
-            }
-            return;
-        }
-        for (bi, xc) in x.chunks_exact(32).enumerate() {
-            let mut amax = 0.0f32;
-            let mut sum = 0.0f32;
-            for &v in xc {
-                let a = v.abs();
-                if a > amax {
-                    amax = a;
-                }
-                sum += v;
-            }
-            let scale = amax / 127.0;
-            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            self.d[bi] = scale;
-            self.bsum[bi] = sum;
-            let dst = &mut self.qs[bi * 32..(bi + 1) * 32];
-            for (o, &v) in dst.iter_mut().zip(xc.iter()) {
-                *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
-            }
-        }
+        crate::vec::backend().quantize_into(x, &mut self.qs, &mut self.d, &mut self.bsum);
     }
 
     pub fn from_f32(x: &[f32]) -> Self {
@@ -138,40 +112,7 @@ impl QuantX {
 /// Fast quantized dot product using Q8-quantized activation `qx` (with f32 fallback).
 #[inline]
 pub fn dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX, x_f32: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2_available() {
-            // SAFETY: runtime check confirmed AVX2 + FMA + F16C.
-            return unsafe {
-                match ty {
-                    GgmlType::Mxfp4 => avx2::dot_mxfp4_q8(src, qx),
-                    GgmlType::Q5K => avx2::dot_q5k_q8(src, qx),
-                    GgmlType::Q6K => avx2::dot_q6k_q8(src, qx),
-                    GgmlType::Q4K => avx2::dot_q4k_q8(src, qx),
-                    GgmlType::Q3K => avx2::dot_q3k_q8(src, qx),
-                    GgmlType::Q8_0 => avx2::dot_q8_0_q8(src, qx),
-                    GgmlType::Iq3S => avx2::dot_iq3s_q8(src, qx),
-                    GgmlType::Iq3Xxs => avx2::dot_iq3xxs_q8(src, qx),
-                    _ => dot_scalar(ty, src, x_f32),
-                }
-            };
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    match ty {
-        GgmlType::Q6K => {
-            if let Some(v) = neon::dot_q6k_q8(src, qx) {
-                return v;
-            }
-        }
-        GgmlType::Q4K => {
-            if let Some(v) = neon::dot_q4k_q8(src, qx) {
-                return v;
-            }
-        }
-        _ => {}
-    }
-    dot_scalar(ty, src, x_f32)
+    crate::vec::backend().dot_q8(ty, src, qx, x_f32)
 }
 
 /// Fused gate+up MXFP4 dots when `fused` is set and this host has the AVX2 kernels; otherwise
@@ -243,7 +184,22 @@ pub fn dot(ty: GgmlType, src: &[u8], x: &[f32]) -> f32 {
     dot_q8(ty, src, &qx, x)
 }
 
-fn dot_scalar(ty: GgmlType, src: &[u8], x: &[f32]) -> f32 {
+/// Entry points used by `crate::vec::Neon`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn neon_available() -> bool {
+    neon::dotprod_available()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
+    match ty {
+        GgmlType::Q6K => neon::dot_q6k_q8(src, qx),
+        GgmlType::Q4K => neon::dot_q4k_q8(src, qx),
+        _ => None,
+    }
+}
+
+pub(crate) fn dot_scalar(ty: GgmlType, src: &[u8], x: &[f32]) -> f32 {
     let (be, _bb) = ty.block();
     debug_assert_eq!(x.len() % be, 0);
     let mut sum = 0.0f32;
@@ -1455,6 +1411,27 @@ pub fn run_experts_cpu(
     });
 }
 
+/// Entry points used by `crate::vec::Avx2`. Kept here so the private kernels stay private.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn avx2_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX, x: &[f32]) -> f32 {
+    match ty {
+        GgmlType::Mxfp4 => avx2::dot_mxfp4_q8(src, qx),
+        GgmlType::Q5K => avx2::dot_q5k_q8(src, qx),
+        GgmlType::Q6K => avx2::dot_q6k_q8(src, qx),
+        GgmlType::Q4K => avx2::dot_q4k_q8(src, qx),
+        GgmlType::Q3K => avx2::dot_q3k_q8(src, qx),
+        GgmlType::Q8_0 => avx2::dot_q8_0_q8(src, qx),
+        GgmlType::Iq3S => avx2::dot_iq3s_q8(src, qx),
+        GgmlType::Iq3Xxs => avx2::dot_iq3xxs_q8(src, qx),
+        _ => dot_scalar(ty, src, x),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn avx2_quantize_into(x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
+    avx2::quantize_into_avx2(x, qs, d, bsum);
+}
+
 /// ARM NEON quantized dots. NEON is baseline on aarch64; Q6_K additionally needs DotProd
 /// (USDOT), which is checked at runtime so other aarch64 cores keep using the scalar path.
 /// The accumulation order mirrors `dot_scalar` so results are bit-identical.
@@ -1465,7 +1442,7 @@ mod neon {
     use std::arch::is_aarch64_feature_detected;
     use std::sync::OnceLock;
 
-    fn dotprod_available() -> bool {
+    pub(super) fn dotprod_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| is_aarch64_feature_detected!("dotprod"))
     }
@@ -1766,6 +1743,16 @@ mod neon {
             let expected = ordered_scalar(&src, &qx);
             let actual = unsafe { dot_q6k_q8_dotprod(&src, &qx) };
             assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+
+        #[test]
+        fn dot_q8_delegates_to_selected_backend() {
+            // The selected backend must produce the same result as calling the dispatch
+            // path for a format where the AVX2 and scalar reductions are order-matched.
+            let (src, x, qx) = sample();
+            let via_backend = crate::vec::backend().dot_q8(GgmlType::Q6K, &src, &qx, &x);
+            let via_dispatch = dot_q8(GgmlType::Q6K, &src, &qx, &x);
+            assert_eq!(via_backend, via_dispatch);
         }
 
         #[test]
