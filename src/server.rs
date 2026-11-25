@@ -830,6 +830,7 @@ pub fn serve(model: Model, tok: Tokenizer, opts: Options) -> Result<()> {
         .route("/v1/completions", post(completions))
         .with_state(state);
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(crate::threads::CpuBudget::server_workers())
         .enable_all()
         .build()?
         .block_on(async move {

@@ -999,6 +999,8 @@ mod avx2 {
     }
 }
 
+/// Sized by `threads::CpuBudget::init` before first use; the fallbacks below only matter
+/// when this module is exercised directly (unit tests) rather than through `main`.
 static MOE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let n = std::env::var("BURN_CPU_THREADS")
         .ok()
