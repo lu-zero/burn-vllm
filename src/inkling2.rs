@@ -496,6 +496,7 @@ struct KvSlot {
     values: Vec<Vec<f32>>,
 }
 
+#[derive(Clone)]
 pub struct State {
     kv: Vec<KvSlot>,
     conv: Vec<Vec<f32>>,
