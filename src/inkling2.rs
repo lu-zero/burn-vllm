@@ -361,6 +361,17 @@ fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) ->
             .map(|r| dot_q8(ty, &raw[r * rb..(r + 1) * rb], &qx, x))
             .collect();
     }
+    // Opt-in fused dequant+dot: same element order, no f32 scratch round-trip.
+    if std::env::var_os("INKLING2_FUSED_DOT").is_some() && crate::fused::supports(ty) {
+        use rayon::prelude::*;
+        return (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                crate::fused::dot_row(ty, &raw[r * rb..(r + 1) * rb], x)
+                    .expect("fused format checked by supports()")
+            })
+            .collect();
+    }
     // Default: exact dequantized dot. Matches llama.cpp's top-1 token on the APEX oracle.
     use rayon::prelude::*;
     (0..rows)
