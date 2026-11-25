@@ -11,6 +11,7 @@ mod radix;
 mod sampler;
 mod selftest;
 mod server;
+mod threads;
 mod tokenizer;
 
 use anyhow::{Result, bail};
@@ -77,6 +78,9 @@ struct Cli {
     /// Time decode-shaped kernels and exit.
     #[arg(long)]
     bench: bool,
+    /// Total CPU thread budget; per-pool shares are derived from it.
+    #[arg(long)]
+    cpu_threads: Option<usize>,
 }
 
 /// Mutually exclusive ways to run the binary. Flags that select more than one are resolved
@@ -143,6 +147,13 @@ fn enable_kernel_cache() {
 
 fn main() -> Result<()> {
     let mut args = Cli::parse();
+    if args.cpu_threads == Some(0) {
+        bail!("--cpu-threads must be greater than zero");
+    }
+    // Publish all CPU thread shares before any pool (Rayon, MOE_POOL, Tokio) initializes.
+    threads::CpuBudget::from_env()
+        .with_total(args.cpu_threads)
+        .init();
     if args.prompts.is_empty() {
         args.prompts
             .push("Explain in two sentences why the sky is blue.".into());
@@ -354,6 +365,7 @@ mod tests {
             serve,
             selftest,
             bench,
+            cpu_threads: None,
         }
     }
 
