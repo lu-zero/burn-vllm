@@ -584,6 +584,9 @@ impl<'a> Model<'a> {
         let n_kv_heads = cfg.n_head_kv;
         let kv_dim = n_kv_heads * cfg.head_dim;
         let inp_sa = x.to_vec();
+        if st.pos == 5 && (slot == 5 || slot == 6) {
+            Self::dump_layer_tensor(&format!("layerin_{slot}"), x);
+        }
 
         // Attention inputs: residual stream, optionally mixed with earlier blocks and
         // merged with the previous pass's gated message.
@@ -593,6 +596,13 @@ impl<'a> Model<'a> {
             let q = self.query(&res_name)?;
             let nq = q.len() / hidden;
             let mixed = mix(blocks, x, &q, hidden, cfg.eps);
+            if st.pos == 5 && (slot == 5 || slot == 6) {
+                Self::dump_layer_tensor(&format!("mixed_{slot}"), &mixed);
+                Self::dump_layer_tensor(&format!("nblocks_{slot}"), &[blocks.len() as f32]);
+                for (bi, b) in blocks.iter().enumerate() {
+                    Self::dump_layer_tensor(&format!("block{bi}_slot{slot}"), b);
+                }
+            }
             for (j, input) in inputs.iter_mut().enumerate() {
                 let off = if is_swa {
                     0
@@ -787,7 +797,7 @@ impl<'a> Model<'a> {
         cur = rms_norm(&cur, norm, cfg.eps);
 
         let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &cur)?;
-        if st.pos == 5 && li == 0 {
+        if st.pos == 5 {
             Self::dump_layer_tensor(&format!("ffn_inp_{slot}"), &ffn_inp);
             Self::dump_layer_tensor(&format!("ffn_moe_logits_{slot}"), &logits);
         }
@@ -807,6 +817,8 @@ impl<'a> Model<'a> {
         cur = vec![0.0f32; hidden];
         let gu_scale = self.expert_scale(&format!("{b}ffn_gate_up_exps.weight"))?;
         let dn_scale = self.expert_scale(&format!("{b}ffn_down_exps.weight"))?;
+        let mut dump_acts = Vec::new();
+        let mut dump_downs = Vec::new();
         for &(_, e) in &selected {
             let (gu_ty, gu, gu_rows, gu_cols) =
                 self.expert(&format!("{b}ffn_gate_up_exps.weight"), e)?;
@@ -830,10 +842,19 @@ impl<'a> Model<'a> {
             if !dn_scale.is_empty() {
                 down.iter_mut().for_each(|v| *v *= dn_scale[e]);
             }
+            if st.pos == 5 && slot == 5 {
+                dump_acts.extend_from_slice(&act);
+                dump_downs.extend_from_slice(&down);
+            }
             let w = probs[e] / wsum * cfg.expert_scale;
             for (c, d) in cur.iter_mut().zip(down) {
                 *c += w * d;
             }
+        }
+        if st.pos == 5 && slot == 5 {
+            Self::dump_layer_tensor("moe_acts_5", &dump_acts);
+            Self::dump_layer_tensor("moe_downs_5", &dump_downs);
+            Self::dump_layer_tensor("ffn_moe_out_5", &cur);
         }
         let ffn_out = self.convolve(
             st,
