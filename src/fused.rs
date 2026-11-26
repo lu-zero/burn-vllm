@@ -36,10 +36,13 @@ pub fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> Option<f32> {
             for (xc, b) in x.chunks_exact(32).zip(row.chunks_exact(24)) {
                 let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
                 let m = f16::from_le_bytes([b[2], b[3]]).to_f32();
-                for j in 0..32 {
-                    let lo = ((b[8 + j / 2] >> (4 * (j % 2))) & 0xF) as u32;
-                    let hi = (((b[4 + j / 8] >> (j % 8)) & 1) << 4) as u32;
-                    sum += (d * (lo | hi) as f32 - m) * xc[j];
+                let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let qs = &b[8..24];
+                for j in 0..16 {
+                    let x0 = (qs[j] & 0x0F) | (((qh >> j) << 4) & 0x10) as u8;
+                    let x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10) as u8;
+                    sum += (d * x0 as f32 + m) * xc[j];
+                    sum += (d * x1 as f32 + m) * xc[j + 16];
                 }
             }
         }
