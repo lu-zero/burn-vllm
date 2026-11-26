@@ -238,11 +238,20 @@ fn convolve(
             out[i] += x * weight[i * conv + lag];
         }
         if let Some(d) = dynamic {
+            // llama.cpp indexes the dynamic tap by lag but takes its window from the
+            // OPPOSITE end of the concatenation: tap 0 multiplies `cur`, tap conv-1 the
+            // oldest history row (inkling2.cpp:224-226).
+            let dyn_window = if lag == 0 {
+                cur
+            } else {
+                let row = conv - 1 - lag;
+                &history[row * channels..(row + 1) * channels]
+            };
             let per_head = channels / heads;
             for h in 0..heads {
                 let t = d[h * conv + lag];
                 for i in 0..per_head {
-                    out[h * per_head + i] += window[h * per_head + i] * t;
+                    out[h * per_head + i] += dyn_window[h * per_head + i] * t;
                 }
             }
         }
@@ -916,7 +925,18 @@ pub fn generate(
         logits = model.forward(st, t)?;
     }
     let debug = std::env::var_os("INKLING2_DEBUG").is_some();
+    let dump = std::env::var("INKLING2_DUMP_LOGITS").ok();
+    let mut dump_file = dump
+        .as_ref()
+        .map(|p| std::fs::File::create(p).expect("create INKLING2_DUMP_LOGITS file"));
     for step in 0..max_new {
+        if let Some(f) = dump_file.as_mut() {
+            use std::io::Write;
+            writeln!(f, "STEP {step}").unwrap();
+            for (i, &v) in logits.iter().enumerate() {
+                writeln!(f, "{i} {v:.7}").unwrap();
+            }
+        }
         if debug {
             let mut top: Vec<(f32, usize)> = logits
                 .iter()
