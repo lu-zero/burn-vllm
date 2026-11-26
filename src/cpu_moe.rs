@@ -246,13 +246,13 @@ pub(crate) unsafe fn neon_quantize_into(x: &[f32], qs: &mut [i8], d: &mut [f32],
     }
 }
 
-#[cfg(target_arch = "aarch64")]
 /// BF16 weights use full-precision activations, so this takes `x` rather than `QuantX`.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn neon_dot_bf16(src: &[u8], x: &[f32]) -> Option<f32> {
     neon::dot_bf16_f32(src, x)
 }
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
     match ty {
         GgmlType::Mxfp4 => neon::dot_mxfp4_q8(src, qx),
