@@ -553,6 +553,18 @@ impl<'a> Model<'a> {
         Ok(out)
     }
 
+    fn dump_layer_tensor(name: &str, data: &[f32]) {
+        let Ok(dir) = std::env::var("INKLING2_DUMP_LAYERS") else {
+            return;
+        };
+        let path = format!("{dir}/rust_s0_{name}.bin");
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).expect("create layer dump");
+        for &v in data {
+            writeln!(f, "{v:.7}").unwrap();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layer(
         &self,
@@ -625,6 +637,9 @@ impl<'a> Model<'a> {
             }
         }
 
+        if st.pos == 5 && slot == 6 {
+            Self::dump_layer_tensor("inputs0_slot6", &inputs[0]);
+        }
         let mut q = self.mat(&format!("{b}attn_q.weight"), &inputs[0])?;
         let mut k = self.mat(&format!("{b}attn_k.weight"), &inputs[1])?;
         let mut v = self.mat(&format!("{b}attn_v.weight"), &inputs[2])?;
@@ -679,9 +694,18 @@ impl<'a> Model<'a> {
                 *x *= tau;
             }
         }
+        if st.pos == 5 {
+            let tag = format!("pos{}", st.pos);
+            Self::dump_layer_tensor(&format!("Qcur_{slot}_{tag}"), &q);
+            Self::dump_layer_tensor(&format!("Kcur_{slot}_{tag}"), &k);
+            Self::dump_layer_tensor(&format!("Vcur_{slot}_{tag}"), &v);
+        }
 
         let sinks = self.mat(&format!("{b}attn_sink_proj.weight"), &inputs[0])?;
         let bias = self.rel_bias(&b, &r, &sinks)?;
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("kq_b_{slot}_pos{}", st.pos), &bias);
+        }
         let kv = &mut st.kv[slot];
         kv.keys.push(k.clone());
         kv.values.push(v.clone());
@@ -702,6 +726,9 @@ impl<'a> Model<'a> {
                 vids.push(val);
             }
             scores.push(0.0); // zero sink
+            if slot == 0 && st.pos == 5 && h == 0 {
+                Self::dump_layer_tensor("scores_h0_pos5", &scores);
+            }
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
@@ -715,6 +742,9 @@ impl<'a> Model<'a> {
             }
         }
 
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("kqv_out_{slot}_pos{}", st.pos), &attn);
+        }
         let gate = self.mat(&format!("{b}attn_gate.weight"), &inputs[0])?;
         for (a, g) in attn.iter_mut().zip(gate) {
             *a *= 1.0 / (1.0 + (-g).exp());
@@ -730,6 +760,9 @@ impl<'a> Model<'a> {
             cfg.hidden,
         )?;
 
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("attn_out_{slot}"), &cur);
+        }
         if ip % cfg.block == 0 {
             blocks.push(inp_sa);
         } else {
@@ -754,6 +787,10 @@ impl<'a> Model<'a> {
         cur = rms_norm(&cur, norm, cfg.eps);
 
         let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &cur)?;
+        if st.pos == 5 && li == 0 {
+            Self::dump_layer_tensor(&format!("ffn_inp_{slot}"), &ffn_inp);
+            Self::dump_layer_tensor(&format!("ffn_moe_logits_{slot}"), &logits);
+        }
         let probs: Vec<f32> = logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
         let bias: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{b}exp_probs_b.bias"))?.1);
         let selection: Vec<(f32, usize)> = probs
@@ -807,6 +844,9 @@ impl<'a> Model<'a> {
             2 * kv_dim + hidden,
             hidden,
         )?;
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("ffn_out_{slot}"), &ffn_out);
+        }
         for (c, f) in ffn_inp.iter_mut().zip(&ffn_out) {
             *c += f;
         }
@@ -833,6 +873,10 @@ impl<'a> Model<'a> {
         let emb = self.embedding(token)?;
         let ln: &[f32] = bytemuck::cast_slice(self.tensor("token_embd_norm.weight")?.1);
         let mut cur = rms_norm(&emb, ln, cfg.eps);
+        if pos == 5 {
+            Self::dump_layer_tensor("embd", &emb);
+            Self::dump_layer_tensor("norm", &cur);
+        }
 
         let tau = 1.0 + cfg.log_alpha * (((pos + 1) / cfg.log_floor).max(1) as f32).ln();
         let mut blocks: Vec<Vec<f32>> = Vec::new();
