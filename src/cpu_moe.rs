@@ -247,6 +247,12 @@ pub(crate) unsafe fn neon_quantize_into(x: &[f32], qs: &mut [i8], d: &mut [f32],
 }
 
 #[cfg(target_arch = "aarch64")]
+/// BF16 weights use full-precision activations, so this takes `x` rather than `QuantX`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn neon_dot_bf16(src: &[u8], x: &[f32]) -> Option<f32> {
+    neon::dot_bf16_f32(src, x)
+}
+
 pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
     match ty {
         GgmlType::Mxfp4 => neon::dot_mxfp4_q8(src, qx),
@@ -1554,6 +1560,14 @@ mod neon {
         Some(unsafe { dot_q5k_q8_dotprod(src, qx) })
     }
 
+    /// BF16 weights against full-precision f32 activations (no activation quantization).
+    pub fn dot_bf16_f32(src: &[u8], x: &[f32]) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_bf16_f32_neon(src, x) })
+    }
+
     /// Q8_0 blocks (34 bytes: f16 scale + 32 i8 weights).
     pub fn dot_q8_0_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
         if !dotprod_available() {
@@ -2006,6 +2020,32 @@ mod neon {
                 qp = qp.add(32);
             }
             sum - min_acc
+        }
+    }
+
+    /// Strict-order BF16 dot: each output accumulates lanes 0..3 as scalar order would.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_bf16_f32_neon(src: &[u8], x: &[f32]) -> f32 {
+        unsafe {
+            let mut acc = vdupq_n_f32(0.0);
+            let chunks = x.len() / 4 * 4;
+            for i in (0..chunks).step_by(4) {
+                // BF16 -> F32 is a left shift of the 16-bit payload into the high half.
+                let bits = vmovl_u16(vld1_u16(src.as_ptr().add(i * 2) as *const u16));
+                let w = vreinterpretq_f32_u32(vshlq_n_u32(bits, 16));
+                let v = vld1q_f32(x.as_ptr().add(i));
+                // vmul + vadd (never FMA) keeps the per-lane rounding of a scalar dot.
+                acc = vaddq_f32(acc, vmulq_f32(w, v));
+            }
+            let mut lanes = [0.0f32; 4];
+            vst1q_f32(lanes.as_mut_ptr(), acc);
+            let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+            for i in chunks..x.len() {
+                let w =
+                    f32::from_bits((u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]) as u32) << 16);
+                sum += w * x[i];
+            }
+            sum
         }
     }
 

@@ -229,6 +229,10 @@ impl VecBackend for Neon {
     }
 
     fn dot_q8(&self, ty: GgmlType, src: &[u8], qx: &QuantX, x: &[f32]) -> f32 {
+        if ty == GgmlType::Bf16 {
+            return crate::cpu_moe::neon_dot_bf16(src, x)
+                .unwrap_or_else(|| Self::fallback(ty, src, qx, x));
+        }
         crate::cpu_moe::neon_dot_q8(ty, src, qx).unwrap_or_else(|| Self::fallback(ty, src, qx, x))
     }
 
@@ -290,6 +294,33 @@ mod tests {
     #[test]
     fn backend_is_selected() {
         assert!(!backend().name().is_empty());
+    }
+
+    #[test]
+    fn backend_bf16_matches_scalar() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let x: Vec<f32> = (0..1024)
+            .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+            .collect();
+        // Build valid finite BF16 payloads from f32 values (random bytes can be NaN).
+        let mut src = Vec::with_capacity(2048);
+        for _ in 0..1024 {
+            let f = ((next() >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+            let bits = f.to_bits();
+            src.extend_from_slice(&((bits >> 16) as u16).to_le_bytes());
+        }
+        let expected = crate::cpu_moe::dot_scalar(GgmlType::Bf16, &src, &x);
+        let got = backend().dot_q8(GgmlType::Bf16, &src, &QuantX::new(), &x);
+        assert!(
+            (got - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+            "bf16 neon={got} scalar={expected}"
+        );
     }
 
     #[test]

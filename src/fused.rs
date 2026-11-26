@@ -11,7 +11,12 @@ use half::f16;
 pub fn supports(ty: GgmlType) -> bool {
     matches!(
         ty,
-        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q5K | GgmlType::Q6K
+        GgmlType::Q8_0
+            | GgmlType::Q5_1
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::Bf16
+            | GgmlType::F16
     )
 }
 
@@ -24,6 +29,18 @@ pub fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> Option<f32> {
     }
     let mut sum = 0.0f32;
     match ty {
+        GgmlType::Bf16 => {
+            // ggml BF16 is the upper 16 bits of an f32; no exponent table needed.
+            for (xv, b) in x.iter().zip(row.chunks_exact(2)) {
+                let w = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16);
+                sum += w * xv;
+            }
+        }
+        GgmlType::F16 => {
+            for (xv, b) in x.iter().zip(row.chunks_exact(2)) {
+                sum += half::f16::from_le_bytes([b[0], b[1]]).to_f32() * xv;
+            }
+        }
         GgmlType::Q8_0 => {
             for (xc, b) in x.chunks_exact(32).zip(row.chunks_exact(34)) {
                 let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
@@ -116,7 +133,14 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for ty in [GgmlType::Q8_0, GgmlType::Q5_1, GgmlType::Q5K, GgmlType::Q6K] {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q5_1,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Bf16,
+            GgmlType::F16,
+        ] {
             let (be, bb) = ty.block();
             let blocks = 4;
             let row: Vec<u8> = (0..blocks * bb).map(|_| next() as u8).collect();
