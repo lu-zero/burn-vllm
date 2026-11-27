@@ -34,6 +34,19 @@ pub struct Model<'a> {
     pub cfg: Config,
 }
 
+fn dump(name: &str, data: &[f32]) {
+    let Ok(dir) = std::env::var("HY4_DUMP") else {
+        return;
+    };
+    let path = format!("{dir}/rust_s0_{name}.bin");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::File::create(path) {
+        for &v in data {
+            writeln!(f, "{v:.7}").ok();
+        }
+    }
+}
+
 fn f32_vec(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     let (t, raw) = tensor(g, name)?;
     ensure!(
@@ -166,6 +179,14 @@ impl<'a> Model<'a> {
         let cfg = &self.cfg;
         let pos = st.pos;
         let (te, traw) = tensor(g, "token_embd.weight")?;
+        if std::env::var_os("HY4_DEBUG_OFFSETS").is_some() {
+            eprintln!(
+                "token_embd offset={} ty={:?} rb={}",
+                te.offset,
+                te.ty,
+                te.ty.row_bytes((te.dims[0] as usize))
+            );
+        }
         // token embedding is a row lookup, not a projection.
         let cols = te.dims[0] as usize;
         let rb = te.ty.row_bytes(cols);
@@ -175,10 +196,14 @@ impl<'a> Model<'a> {
             &traw[token as usize * rb..(token as usize + 1) * rb],
             &mut emb,
         );
+        if std::env::var_os("HY4_DEBUG_OFFSETS").is_some() {
+            eprintln!("EMB token={token} first={:?}", &emb[..8]);
+        }
         let mut streams = Vec::with_capacity(cfg.hidden * cfg.hc_count);
         for _ in 0..cfg.hc_count {
             streams.extend_from_slice(&emb);
         }
+        dump("hc_init", &streams);
 
         for il in 0..cfg.n_layers - cfg.nextn_layers {
             let b = format!("blk.{il}.");
@@ -192,13 +217,23 @@ impl<'a> Model<'a> {
                     *c += v * pre[s];
                 }
             }
+            if il == 0 {
+                dump("hc_pre", &pre);
+                dump("hc_post_gate", &post);
+            }
             let an = f32_vec(g, &format!("{b}attn_norm.weight"))?;
             cur = rms_norm(&cur, &an, cfg.eps);
+            if il == 0 {
+                dump("attn_norm", &cur);
+            }
 
             // MLA q path.
             let qa = mv(g, &format!("{b}attn_q_a.weight"), &cur)?;
             let qan = f32_vec(g, &format!("{b}attn_q_a_norm.weight"))?;
             let qr = rms_norm(&qa, &qan, cfg.eps);
+            if il == 0 {
+                dump("q_resid", &qr);
+            }
             let heads = cfg.head_counts[il];
             let mut qb = mv(g, &format!("{b}attn_q_b.weight"), &qr)?;
             let qdim = cfg.key_len_mla; // 256 per head
@@ -225,6 +260,10 @@ impl<'a> Model<'a> {
             let mut kpe = vec![0.0f32; cfg.qk_rope_dim];
             kpe.copy_from_slice(&kva[cfg.kv_lora_rank..]);
             rope_tail(&mut kpe, cfg.qk_rope_dim, pos, rope_base);
+            if il == 0 {
+                dump("k_pe", &kpe);
+                dump("kv_cmpr", &kv);
+            }
             let mut krow = Vec::with_capacity(cfg.kv_lora_rank + cfg.qk_rope_dim);
             krow.extend_from_slice(&kv);
             krow.extend_from_slice(&kpe);
@@ -237,6 +276,18 @@ impl<'a> Model<'a> {
             for h in 0..heads {
                 qnope[h * qnope_dim..(h + 1) * qnope_dim]
                     .copy_from_slice(&qb[h * qdim..h * qdim + qnope_dim]);
+            }
+            if std::env::var_os("HY4_DEBUG_OFFSETS").is_some() && il == 0 {
+                eprintln!(
+                    "q_b offset={} wk_b offset={} wv_b offset={}",
+                    tensor(g, &format!("{b}attn_q_b.weight"))
+                        .map(|x| x.0.offset)
+                        .unwrap_or(0),
+                    kt.offset,
+                    tensor(g, &format!("{b}attn_v_b.weight"))
+                        .map(|x| x.0.offset)
+                        .unwrap_or(0)
+                );
             }
             let kc = kt.dims[0] as usize; // 192
             let kr = kt.dims[1] as usize; // 512
@@ -254,8 +305,15 @@ impl<'a> Model<'a> {
                 }
             }
 
+            if il == 0 {
+                dump("qabsorbed", &qabsorbed);
+            }
             // Attention over all cached cells (indexer stub: full causal set).
             let sinks = f32_vec(g, &format!("{b}attn_sinks.weight"))?;
+            if il == 0 {
+                dump("sinks", &sinks);
+                dump("q_pe", &qb);
+            }
             let keys = &st.kv[il];
             let scale = 1.0 / (cfg.key_len_mla as f32).sqrt();
             let mut attn = vec![0.0f32; heads * cfg.value_len];
@@ -271,11 +329,14 @@ impl<'a> Model<'a> {
                     }
                     scores.push(dot * scale);
                 }
+                if il == 0 && h == 0 {
+                    dump("scores_h0", &scores);
+                }
                 scores.push(sinks[h]); // sink logit
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
                 let sum: f32 = exps.iter().sum();
-                let vdim = cfg.value_len_mla;
+                let vdim = cfg.value_len;
                 for (j, key) in keys.iter().enumerate() {
                     let w = exps[j] / sum;
                     for i in 0..vdim {
@@ -299,13 +360,27 @@ impl<'a> Model<'a> {
                     decompressed[h * vr + r] = s;
                 }
             }
-            let mut ao = mv(g, &format!("{b}attn_output.weight"), &decompressed)?;
+            if il == 0 {
+                dump("attn_values", &attn);
+                dump("attn_kqv", &decompressed);
+            }
             let gate = mv(g, &format!("{b}attn_gate.weight"), &cur)?;
-            for (a, &gval) in ao.iter_mut().zip(&gate) {
+            let mut gated = decompressed.clone();
+            for (a, &gval) in gated.iter_mut().zip(&gate) {
                 *a *= sigmoid(gval);
+            }
+            if il == 0 {
+                dump("attn_gated", &gated);
+            }
+            let mut ao = mv(g, &format!("{b}attn_output.weight"), &gated)?;
+            if il == 0 {
+                dump("attn_gated", &ao);
             }
             let pan = f32_vec(g, &format!("{b}post_attention_norm.weight"))?;
             ao = rms_norm(&ao, &pan, cfg.eps);
+            if il == 0 {
+                dump("attn_out", &ao);
+            }
 
             // Scatter back into four streams with attention post gates.
             for s in 0..cfg.hc_count {
@@ -324,6 +399,9 @@ impl<'a> Model<'a> {
             }
             let fnorm = f32_vec(g, &format!("{b}ffn_norm.weight"))?;
             let ffn_in = rms_norm(&ffn_in, &fnorm, cfg.eps);
+            if il == 0 {
+                dump("ffn_norm", &ffn_in);
+            }
 
             let ffn_out = if il < cfg.leading_dense {
                 // Dense FFN at layer 0; other PLE layers use MoE too in llama.cpp.
@@ -333,6 +411,9 @@ impl<'a> Model<'a> {
             };
             let pfn = f32_vec(g, &format!("{b}post_ffw_norm.weight"))?;
             let ffn_out = rms_norm(&ffn_out, &pfn, cfg.eps);
+            if il == 0 {
+                dump("ffn_out", &ffn_out);
+            }
             for s in 0..cfg.hc_count {
                 for i in 0..cfg.hidden {
                     streams[s * cfg.hidden + i] += post_ffn[s] * ffn_out[i];
@@ -340,6 +421,7 @@ impl<'a> Model<'a> {
             }
         }
 
+        dump("l_out", &streams);
         // Head: hc reduce -> output norm -> lm_head.
         let mut flat = Vec::with_capacity(cfg.hidden * cfg.hc_count);
         for s in 0..cfg.hc_count {
@@ -359,8 +441,10 @@ impl<'a> Model<'a> {
                 hidden[i] += w * streams[s * cfg.hidden + i];
             }
         }
+        dump("hc_head", &hidden);
         let on = f32_vec(g, "output_norm.weight")?;
         hidden = rms_norm(&hidden, &on, cfg.eps);
+        dump("result_norm", &hidden);
         let logits = matvec(
             tensor(g, "output.weight")?.0,
             g.bytes(g.tensor("output.weight")?),
