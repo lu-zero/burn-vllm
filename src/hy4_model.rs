@@ -1,0 +1,462 @@
+//! Hy4-flash CPU forward (P2), transcribed from llama.cpp `hy-v4-flash.cpp` @ 15fcfc735.
+//!
+//! Deliberate approximations for the first gate:
+//! - Engram/PLE deltas are skipped: their lookup table lives on shard 2 as F8_E4M3.
+//! - The indexer's top-2048 selection is replaced by all causal MLA cells (valid while the
+//!   prompt is shorter than ~2044 cells).
+//! - M-RoPE text inputs use one position plane, i.e. plain RoPE on the tail 64 dims.
+
+use crate::gguf::{Gguf, TensorInfo};
+use crate::hy4::Config;
+use crate::quant::{GgmlType, dequant};
+use anyhow::{Result, ensure};
+use rayon::prelude::*;
+
+pub struct State {
+    /// MLA K rows [576] per layer, oldest first.
+    pub kv: Vec<Vec<Vec<f32>>>,
+    pub pos: usize,
+    pub prev_token: u32,
+}
+
+impl State {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            kv: vec![Vec::new(); cfg.n_layers - cfg.nextn_layers],
+            pos: 0,
+            prev_token: 0,
+        }
+    }
+}
+
+pub struct Model<'a> {
+    g: &'a Gguf,
+    pub cfg: Config,
+}
+
+fn f32_vec(g: &Gguf, name: &str) -> Result<Vec<f32>> {
+    let (t, raw) = tensor(g, name)?;
+    ensure!(
+        t.ty == GgmlType::F32,
+        "{name}: expected F32, got {:?}",
+        t.ty
+    );
+    Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
+}
+
+fn tensor<'a>(g: &'a Gguf, name: &str) -> Result<(&'a TensorInfo, &'a [u8])> {
+    let t = g.tensor(name)?;
+    Ok((t, g.bytes(t)))
+}
+
+/// Exact dequantized matvec: `out[r] = sum_j dequant(w[r,j]) * x[j]`.
+fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32]) -> Vec<f32> {
+    ensure_dims(t, x.len());
+    let cols = t.dims[0] as usize;
+    let rows = t.dims[1] as usize;
+    let rb = t.ty.row_bytes(cols);
+    (0..rows)
+        .into_par_iter()
+        .map_init(
+            || vec![0.0f32; cols],
+            |scratch, r| {
+                dequant(t.ty, &raw[r * rb..(r + 1) * rb], scratch);
+                scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+            },
+        )
+        .collect()
+}
+
+/// Expert slice of a 3-D [cols, rows, experts] weight.
+fn expert_matvec(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32]) -> Vec<f32> {
+    ensure_dims(t, x.len());
+    let cols = t.dims[0] as usize;
+    let rows = t.dims[1] as usize;
+    let rb = t.ty.row_bytes(cols);
+    let per = rows * rb;
+    let base = &raw[e * per..(e + 1) * per];
+    (0..rows)
+        .into_par_iter()
+        .map_init(
+            || vec![0.0f32; cols],
+            |scratch, r| {
+                dequant(t.ty, &base[r * rb..(r + 1) * rb], scratch);
+                scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+            },
+        )
+        .collect()
+}
+
+fn ensure_dims(t: &TensorInfo, cols: usize) {
+    assert_eq!(t.dims[0] as usize, cols, "{}: cols mismatch", t.name);
+}
+
+fn mv(g: &Gguf, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+    let (t, raw) = tensor(g, name)?;
+    Ok(matvec(t, raw, x))
+}
+
+fn emv(g: &Gguf, name: &str, e: usize, x: &[f32]) -> Result<Vec<f32>> {
+    let (t, raw) = tensor(g, name)?;
+    Ok(expert_matvec(t, raw, e, x))
+}
+
+fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let sum: f32 = x.iter().map(|v| v * v).sum();
+    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
+    x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn rope_tail(v: &mut [f32], dim: usize, pos: usize, base: f64) {
+    let n = v.len();
+    let start = n - dim;
+    let mut neox = vec![0.0f32; dim];
+    for i in 0..dim / 2 {
+        neox[i] = v[start + 2 * i];
+        neox[i + dim / 2] = v[start + 2 * i + 1];
+    }
+    for i in 0..dim / 2 {
+        let theta = pos as f64 / base.powf(2.0 * i as f64 / dim as f64);
+        let (c, s) = (theta.cos() as f32, theta.sin() as f32);
+        let a = neox[i];
+        let b = neox[i + dim / 2];
+        neox[i] = a * c - b * s;
+        neox[i + dim / 2] = a * s + b * c;
+    }
+    for i in 0..dim / 2 {
+        v[start + 2 * i] = neox[i];
+        v[start + 2 * i + 1] = neox[i + dim / 2];
+    }
+}
+
+fn hc_pre(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f32>)> {
+    let hc = cfg.hc_count;
+    let mut flat = Vec::with_capacity(x.len() * hc);
+    for s in 0..hc {
+        flat.extend_from_slice(&x[s * cfg.hidden..(s + 1) * cfg.hidden]);
+    }
+    let normed = rms_norm(&flat, &vec![1.0; flat.len()], cfg.eps);
+    let mixes = mv(g, &format!("{b}hc_attn_fn.weight"), &normed)?;
+    let base = f32_vec(g, &format!("{b}hc_attn_base.weight"))?;
+    let scale = f32_vec(g, &format!("{b}hc_attn_scale.weight"))?;
+    let mut pre = vec![0.0; hc];
+    let mut post = vec![0.0; hc];
+    for i in 0..hc {
+        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + 1e-6;
+        post[i] = cfg.hc_magnitude * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]) + 1e-6;
+    }
+    Ok((pre, post))
+}
+
+impl<'a> Model<'a> {
+    pub fn new(g: &'a Gguf, cfg: Config) -> Result<Self> {
+        Ok(Self { g, cfg })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub fn forward(&self, st: &mut State, token: u32) -> Result<Vec<f32>> {
+        let g = self.g;
+        let cfg = &self.cfg;
+        let pos = st.pos;
+        let (te, traw) = tensor(g, "token_embd.weight")?;
+        // token embedding is a row lookup, not a projection.
+        let cols = te.dims[0] as usize;
+        let rb = te.ty.row_bytes(cols);
+        let mut emb = vec![0.0f32; cols];
+        dequant(
+            te.ty,
+            &traw[token as usize * rb..(token as usize + 1) * rb],
+            &mut emb,
+        );
+        let mut streams = Vec::with_capacity(cfg.hidden * cfg.hc_count);
+        for _ in 0..cfg.hc_count {
+            streams.extend_from_slice(&emb);
+        }
+
+        for il in 0..cfg.n_layers - cfg.nextn_layers {
+            let b = format!("blk.{il}.");
+            let (pre, post) = hc_pre(g, &b, &streams, cfg)?;
+            let mut cur = vec![0.0f32; cfg.hidden];
+            for s in 0..cfg.hc_count {
+                for (c, &v) in cur
+                    .iter_mut()
+                    .zip(&streams[s * cfg.hidden..(s + 1) * cfg.hidden])
+                {
+                    *c += v * pre[s];
+                }
+            }
+            let an = f32_vec(g, &format!("{b}attn_norm.weight"))?;
+            cur = rms_norm(&cur, &an, cfg.eps);
+
+            // MLA q path.
+            let qa = mv(g, &format!("{b}attn_q_a.weight"), &cur)?;
+            let qan = f32_vec(g, &format!("{b}attn_q_a_norm.weight"))?;
+            let qr = rms_norm(&qa, &qan, cfg.eps);
+            let heads = cfg.head_counts[il];
+            let mut qb = mv(g, &format!("{b}attn_q_b.weight"), &qr)?;
+            let qdim = cfg.key_len_mla; // 256 per head
+            let rope_base = if cfg.swa_pattern[il] {
+                cfg.freq_base_swa
+            } else {
+                cfg.freq_base
+            };
+            for h in 0..heads {
+                rope_tail(
+                    &mut qb[h * qdim..(h + 1) * qdim],
+                    cfg.qk_rope_dim,
+                    pos,
+                    rope_base,
+                );
+            }
+
+            // MLA kv path: compressed [512] + rope tail [64].
+            let kva = mv(g, &format!("{b}attn_kv_a_mqa.weight"), &cur)?;
+            let kvn = f32_vec(g, &format!("{b}attn_kv_a_norm.weight"))?;
+            let mut kv = vec![0.0f32; cfg.kv_lora_rank];
+            kv.copy_from_slice(&kva[..cfg.kv_lora_rank]);
+            kv = rms_norm(&kv, &kvn, cfg.eps);
+            let mut kpe = vec![0.0f32; cfg.qk_rope_dim];
+            kpe.copy_from_slice(&kva[cfg.kv_lora_rank..]);
+            rope_tail(&mut kpe, cfg.qk_rope_dim, pos, rope_base);
+            let mut krow = Vec::with_capacity(cfg.kv_lora_rank + cfg.qk_rope_dim);
+            krow.extend_from_slice(&kv);
+            krow.extend_from_slice(&kpe);
+            st.kv[il].push(krow);
+
+            // Absorb q_nope with wk_b: [192,512,heads] -> [512,heads].
+            let (kt, kraw) = tensor(g, &format!("{b}attn_k_b.weight"))?;
+            let qnope_dim = cfg.key_len_mla - cfg.qk_rope_dim;
+            let mut qnope = vec![0.0f32; qnope_dim * heads];
+            for h in 0..heads {
+                qnope[h * qnope_dim..(h + 1) * qnope_dim]
+                    .copy_from_slice(&qb[h * qdim..h * qdim + qnope_dim]);
+            }
+            let kc = kt.dims[0] as usize; // 192
+            let kr = kt.dims[1] as usize; // 512
+            let kper = kraw.len() / heads;
+            let mut qabsorbed = vec![0.0f32; kr * heads];
+            for h in 0..heads {
+                let base = &kraw[h * kper..];
+                for r in 0..kr {
+                    let mut s = 0.0f32;
+                    for c in 0..kc {
+                        let w = dequant_one(kt.ty, base, r * kc + c);
+                        s += w * qnope[h * qnope_dim + c];
+                    }
+                    qabsorbed[h * kr + r] = s;
+                }
+            }
+
+            // Attention over all cached cells (indexer stub: full causal set).
+            let sinks = f32_vec(g, &format!("{b}attn_sinks.weight"))?;
+            let keys = &st.kv[il];
+            let scale = 1.0 / (cfg.key_len_mla as f32).sqrt();
+            let mut attn = vec![0.0f32; heads * cfg.value_len];
+            for h in 0..heads {
+                let mut scores = Vec::with_capacity(keys.len() + 1);
+                for key in keys {
+                    let mut dot = 0.0f32;
+                    for i in 0..kr {
+                        dot += qabsorbed[h * kr + i] * key[i];
+                    }
+                    for i in 0..cfg.qk_rope_dim {
+                        dot += qb[h * qdim + qnope_dim + i] * key[cfg.kv_lora_rank + i];
+                    }
+                    scores.push(dot * scale);
+                }
+                scores.push(sinks[h]); // sink logit
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                let vdim = cfg.value_len_mla;
+                for (j, key) in keys.iter().enumerate() {
+                    let w = exps[j] / sum;
+                    for i in 0..vdim {
+                        attn[h * vdim + i] += w * key[i];
+                    }
+                }
+            }
+            // MLA value decompression via wv_b [512,256,heads].
+            let (vt, vraw) = tensor(g, &format!("{b}attn_v_b.weight"))?;
+            let vc = vt.dims[0] as usize;
+            let vr = vt.dims[1] as usize;
+            let vper = vraw.len() / heads;
+            let mut decompressed = vec![0.0f32; heads * vr];
+            for h in 0..heads {
+                let base = &vraw[h * vper..];
+                for r in 0..vr {
+                    let mut s = 0.0f32;
+                    for c in 0..vc {
+                        s += dequant_one(vt.ty, base, r * vc + c) * attn[h * vc + c];
+                    }
+                    decompressed[h * vr + r] = s;
+                }
+            }
+            let mut ao = mv(g, &format!("{b}attn_output.weight"), &decompressed)?;
+            let gate = mv(g, &format!("{b}attn_gate.weight"), &cur)?;
+            for (a, &gval) in ao.iter_mut().zip(&gate) {
+                *a *= sigmoid(gval);
+            }
+            let pan = f32_vec(g, &format!("{b}post_attention_norm.weight"))?;
+            ao = rms_norm(&ao, &pan, cfg.eps);
+
+            // Scatter back into four streams with attention post gates.
+            for s in 0..cfg.hc_count {
+                for i in 0..cfg.hidden {
+                    streams[s * cfg.hidden + i] += post[s] * ao[i];
+                }
+            }
+
+            // FFN pre: recompute both gate sets from the scattered streams, reduce with `pre`.
+            let (pre_ffn, post_ffn) = hc_ffn(g, &b, &streams, cfg)?;
+            let mut ffn_in = vec![0.0f32; cfg.hidden];
+            for s in 0..cfg.hc_count {
+                for i in 0..cfg.hidden {
+                    ffn_in[i] += streams[s * cfg.hidden + i] * pre_ffn[s];
+                }
+            }
+            let fnorm = f32_vec(g, &format!("{b}ffn_norm.weight"))?;
+            let ffn_in = rms_norm(&ffn_in, &fnorm, cfg.eps);
+
+            let ffn_out = if il < cfg.leading_dense {
+                // Dense FFN at layer 0; other PLE layers use MoE too in llama.cpp.
+                dense_ffn(g, &b, &ffn_in)?
+            } else {
+                moe_ffn(g, &b, &ffn_in, cfg)?
+            };
+            let pfn = f32_vec(g, &format!("{b}post_ffw_norm.weight"))?;
+            let ffn_out = rms_norm(&ffn_out, &pfn, cfg.eps);
+            for s in 0..cfg.hc_count {
+                for i in 0..cfg.hidden {
+                    streams[s * cfg.hidden + i] += post_ffn[s] * ffn_out[i];
+                }
+            }
+        }
+
+        // Head: hc reduce -> output norm -> lm_head.
+        let mut flat = Vec::with_capacity(cfg.hidden * cfg.hc_count);
+        for s in 0..cfg.hc_count {
+            flat.extend_from_slice(&streams[s * cfg.hidden..(s + 1) * cfg.hidden]);
+        }
+        let mixes = mv(
+            g,
+            "output_hc_fn.weight",
+            &rms_norm(&flat, &vec![1.0; flat.len()], cfg.eps),
+        )?;
+        let hbase = f32_vec(g, "output_hc_base.weight")?;
+        let hscale = f32_vec(g, "output_hc_scale.weight")?[0];
+        let mut hidden = vec![0.0f32; cfg.hidden];
+        for s in 0..cfg.hc_count {
+            let w = sigmoid(mixes[s] * hscale + hbase[s]) + 1e-6;
+            for i in 0..cfg.hidden {
+                hidden[i] += w * streams[s * cfg.hidden + i];
+            }
+        }
+        let on = f32_vec(g, "output_norm.weight")?;
+        hidden = rms_norm(&hidden, &on, cfg.eps);
+        let logits = matvec(
+            tensor(g, "output.weight")?.0,
+            g.bytes(g.tensor("output.weight")?),
+            &hidden,
+        );
+        st.pos += 1;
+        st.prev_token = token;
+        Ok(logits)
+    }
+}
+
+fn dequant_one(ty: GgmlType, row: &[u8], i: usize) -> f32 {
+    let (be, bb) = ty.block();
+    let block = i / be;
+    let off = block * bb;
+    let mut scratch = vec![0.0f32; be];
+    dequant(ty, &row[off..off + bb], &mut scratch);
+    scratch[i % be]
+}
+
+fn hc_ffn(g: &Gguf, b: &str, streams: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f32>)> {
+    let hc = cfg.hc_count;
+    let mut flat = Vec::with_capacity(cfg.hidden * hc);
+    for s in 0..hc {
+        flat.extend_from_slice(&streams[s * cfg.hidden..(s + 1) * cfg.hidden]);
+    }
+    let normed = rms_norm(&flat, &vec![1.0; flat.len()], cfg.eps);
+    let mixes = mv(g, &format!("{b}hc_ffn_fn.weight"), &normed)?;
+    let base = f32_vec(g, &format!("{b}hc_ffn_base.weight"))?;
+    let scale = f32_vec(g, &format!("{b}hc_ffn_scale.weight"))?;
+    let mut pre = vec![0.0; hc];
+    let mut post = vec![0.0; hc];
+    for i in 0..hc {
+        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + 1e-6;
+        post[i] = cfg.hc_magnitude * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]) + 1e-6;
+    }
+    Ok((pre, post))
+}
+
+fn dense_ffn(g: &Gguf, b: &str, x: &[f32]) -> Result<Vec<f32>> {
+    let up = mv(g, &format!("{b}ffn_up.weight"), x)?;
+    let gate = mv(g, &format!("{b}ffn_gate.weight"), x)?;
+    let act: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    mv(g, &format!("{b}ffn_down.weight"), &act)
+}
+
+fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
+    let logits = mv(g, &format!("{b}ffn_gate_inp.weight"), x)?;
+    let bias = f32_vec(g, &format!("{b}exp_probs_b.bias"))?;
+    let mut sel: Vec<(f32, usize)> = logits
+        .iter()
+        .zip(&bias)
+        .enumerate()
+        .map(|(e, (&l, &b))| (sigmoid(l) + b, e))
+        .collect();
+    sel.sort_by(|a, b| b.0.total_cmp(&a.0));
+    sel.truncate(cfg.n_expert_used);
+    let mut weights: Vec<f32> = sel.iter().map(|&(_, e)| sigmoid(logits[e])).collect();
+    let wsum: f32 = weights.iter().sum::<f32>().max(6.103515625e-5);
+    for w in &mut weights {
+        *w = *w / wsum * cfg.expert_weights_scale;
+    }
+    let routed = mv(g, &format!("{b}ffn_routed_down.weight"), x)?;
+    let mut out = vec![0.0f32; cfg.hidden];
+    for (idx, &(_, e)) in sel.iter().enumerate() {
+        let up = emv(g, &format!("{b}ffn_up_exps.weight"), e, &routed)?;
+        let gate = emv(g, &format!("{b}ffn_gate_exps.weight"), e, &routed)?;
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let g = g.min(10.0);
+                let u = u.clamp(-10.0, 10.0);
+                g / (1.0 + (-g).exp()) * u
+            })
+            .collect();
+        let down = emv(g, &format!("{b}ffn_down_exps.weight"), e, &act)?;
+        let latent = mv(g, &format!("{b}ffn_routed_up.weight"), &down)?;
+        for (o, &v) in out.iter_mut().zip(&latent) {
+            *o += weights[idx] * v;
+        }
+    }
+    let sg = mv(g, &format!("{b}ffn_gate_shexp.weight"), x)?;
+    let su = mv(g, &format!("{b}ffn_up_shexp.weight"), x)?;
+    let sa: Vec<f32> = sg
+        .iter()
+        .zip(&su)
+        .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    let shared = mv(g, &format!("{b}ffn_down_shexp.weight"), &sa)?;
+    for (o, &v) in out.iter_mut().zip(&shared) {
+        *o += v;
+    }
+    Ok(out)
+}
