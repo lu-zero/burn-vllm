@@ -4,6 +4,7 @@ mod gguf;
 mod gpu;
 mod hy4;
 mod hy4_model;
+mod hy4_indexer;
 mod hy4_tensors;
 mod inkling2;
 mod iq_grids;
