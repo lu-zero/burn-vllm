@@ -17,6 +17,8 @@ pub struct State {
     pub kv: Vec<Vec<Vec<f32>>>,
     pub pos: usize,
     pub prev_token: u32,
+    /// Token history (oldest first) for the Engram n-gram hash.
+    pub tokens: Vec<u32>,
 }
 
 impl State {
@@ -25,6 +27,7 @@ impl State {
             kv: vec![Vec::new(); cfg.n_layers - cfg.nextn_layers],
             pos: 0,
             prev_token: 0,
+            tokens: Vec::new(),
         }
     }
 }
@@ -32,6 +35,7 @@ impl State {
 pub struct Model<'a> {
     g: &'a Gguf,
     pub cfg: Config,
+    shard2: Option<std::path::PathBuf>,
 }
 
 fn dump(name: &str, data: &[f32]) {
@@ -187,8 +191,8 @@ fn hc_pre(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f
 }
 
 impl<'a> Model<'a> {
-    pub fn new(g: &'a Gguf, cfg: Config) -> Result<Self> {
-        Ok(Self { g, cfg })
+    pub fn new(g: &'a Gguf, cfg: Config, shard2: Option<std::path::PathBuf>) -> Result<Self> {
+        Ok(Self { g, cfg, shard2 })
     }
 
     pub fn config(&self) -> &Config {
@@ -226,8 +230,24 @@ impl<'a> Model<'a> {
         }
         dump("hc_init", &streams);
 
+        let engram = self
+            .shard2
+            .as_ref()
+            .map(|p| crate::hy4_engram::Engram::new(g, p, cfg))
+            .transpose()?;
+
         for il in 0..cfg.n_layers - cfg.nextn_layers {
             let b = format!("blk.{il}.");
+            if let Some(ref en) = engram {
+                if en.has_layer(il) {
+                    let n_prev = cfg.ple_ngram.saturating_sub(1);
+                    let start = st.tokens.len().saturating_sub(n_prev);
+                    let delta = en.delta(il, token, &st.tokens[start..], &streams)?;
+                    for (s, &d) in streams.iter_mut().zip(&delta) {
+                        *s += d;
+                    }
+                }
+            }
             let (pre, post) = hc_pre(g, &b, &streams, cfg)?;
             let mut cur = vec![0.0f32; cfg.hidden];
             for s in 0..cfg.hc_count {
@@ -482,6 +502,7 @@ impl<'a> Model<'a> {
         );
         st.pos += 1;
         st.prev_token = token;
+        st.tokens.push(token);
         Ok(logits)
     }
 }

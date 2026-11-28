@@ -4,8 +4,8 @@ mod gguf;
 mod gpu;
 mod hy4;
 mod hy4_engram;
-mod hy4_model;
 mod hy4_indexer;
+mod hy4_model;
 mod hy4_tensors;
 mod inkling2;
 mod iq_grids;
@@ -183,7 +183,15 @@ fn main() -> Result<()> {
                 tok.encode(args.prompts[0].as_str())?
             }
         };
-        let model = hy4_model::Model::new(&gguf, cfg)?;
+        let shard2 = model_path
+            .to_string_lossy()
+            .replace("-00001-of-00002.gguf", "-00002-of-00002.gguf");
+        let shard2 = if shard2 != model_path.to_string_lossy() {
+            Some(std::path::PathBuf::from(shard2))
+        } else {
+            None
+        };
+        let model = hy4_model::Model::new(&gguf, cfg, shard2)?;
         let mut st = hy4_model::State::new(model.config());
         let mut logits = Vec::new();
         for &t in &prompt {
