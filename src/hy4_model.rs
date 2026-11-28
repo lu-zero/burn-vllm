@@ -146,6 +146,26 @@ fn rope_tail(v: &mut [f32], dim: usize, pos: usize, base: f64) {
     }
 }
 
+/// iHC gate affine from llama.cpp `build_hc_pre` (hy-v4-flash.cpp:558-575).
+/// The pre half gets `hc_eps` after the sigmoid; the post half is scaled by
+/// `hc_magnitude` first and then gets the same additive epsilon.
+fn hc_gates(
+    mixes: &[f32],
+    base: &[f32],
+    scale: &[f32],
+    hc: usize,
+    eps: f32,
+    magnitude: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut pre = vec![0.0; hc];
+    let mut post = vec![0.0; hc];
+    for i in 0..hc {
+        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + eps;
+        post[i] = magnitude * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]) + eps;
+    }
+    (pre, post)
+}
+
 fn hc_pre(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f32>)> {
     let hc = cfg.hc_count;
     let mut flat = Vec::with_capacity(x.len() * hc);
@@ -156,13 +176,14 @@ fn hc_pre(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f
     let mixes = mv(g, &format!("{b}hc_attn_fn.weight"), &normed)?;
     let base = f32_vec(g, &format!("{b}hc_attn_base.weight"))?;
     let scale = f32_vec(g, &format!("{b}hc_attn_scale.weight"))?;
-    let mut pre = vec![0.0; hc];
-    let mut post = vec![0.0; hc];
-    for i in 0..hc {
-        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + 1e-6;
-        post[i] = cfg.hc_magnitude * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]) + 1e-6;
-    }
-    Ok((pre, post))
+    Ok(hc_gates(
+        &mixes,
+        &base,
+        &scale,
+        hc,
+        cfg.hc_eps,
+        cfg.hc_magnitude,
+    ))
 }
 
 impl<'a> Model<'a> {
@@ -218,8 +239,8 @@ impl<'a> Model<'a> {
                 }
             }
             if il == 0 {
-                dump("hc_pre", &pre);
-                dump("hc_post_gate", &post);
+                dump("hc_attn_pre", &pre);
+                dump("hc_attn_post_gate", &post);
             }
             let an = f32_vec(g, &format!("{b}attn_norm.weight"))?;
             cur = rms_norm(&cur, &an, cfg.eps);
@@ -391,6 +412,15 @@ impl<'a> Model<'a> {
 
             // FFN pre: recompute both gate sets from the scattered streams, reduce with `pre`.
             let (pre_ffn, post_ffn) = hc_ffn(g, &b, &streams, cfg)?;
+            if il == 0 {
+                // The oracle's cb_eval dump_cb writes every tensor whose name
+                // matches, so duplicate `hc_pre-0` / `hc_post_gate-0` names
+                // (attention and FFN in the same layer) leave the FFN values
+                // in the file. Use the same names here for an apples-to-apples
+                // comparison; the attention gates stay under their own names.
+                dump("hc_pre", &pre_ffn);
+                dump("hc_post_gate", &post_ffn);
+            }
             let mut ffn_in = vec![0.0f32; cfg.hidden];
             for s in 0..cfg.hc_count {
                 for i in 0..cfg.hidden {
@@ -475,13 +505,14 @@ fn hc_ffn(g: &Gguf, b: &str, streams: &[f32], cfg: &Config) -> Result<(Vec<f32>,
     let mixes = mv(g, &format!("{b}hc_ffn_fn.weight"), &normed)?;
     let base = f32_vec(g, &format!("{b}hc_ffn_base.weight"))?;
     let scale = f32_vec(g, &format!("{b}hc_ffn_scale.weight"))?;
-    let mut pre = vec![0.0; hc];
-    let mut post = vec![0.0; hc];
-    for i in 0..hc {
-        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + 1e-6;
-        post[i] = cfg.hc_magnitude * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]) + 1e-6;
-    }
-    Ok((pre, post))
+    Ok(hc_gates(
+        &mixes,
+        &base,
+        &scale,
+        hc,
+        cfg.hc_eps,
+        cfg.hc_magnitude,
+    ))
 }
 
 fn dense_ffn(g: &Gguf, b: &str, x: &[f32]) -> Result<Vec<f32>> {
@@ -543,4 +574,46 @@ fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
         *o += v;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hc_gates_match_llama_cpp_oracle() {
+        // Mixes reconstructed from layer 0's GGUF hc_ffn weights and the
+        // oracle's pre-FFN streams (derived from its l_out/ffn_out dumps);
+        // expected gates are the oracle's hc_pre-0 / hc_post_gate-0 dumps.
+        let mixes = [
+            46.363404919962626,
+            13.768153751825583,
+            61.25920194286107,
+            -0.21866374971841163,
+            -71.4978042631353,
+            -73.01675480395812,
+            -68.49864367902363,
+            -75.44309509037527,
+        ];
+        let base = [
+            -0.45957013964653015,
+            -1.0124915838241577,
+            -0.5869624018669128,
+            -1.2386435270309448,
+            -1.0106960535049438,
+            -0.9643658995628357,
+            -0.9665372967720032,
+            -0.9494650959968567,
+        ];
+        let scale = [0.036176469177007675, 0.03920025750994682];
+        let (pre, post) = hc_gates(&mixes, &base, &scale, 4, 1e-6, 2.0);
+        let want_pre = [0.77165854, 0.37416163, 0.8360582, 0.2232982];
+        let want_post = [0.04319239, 0.04263756, 0.05058242, 0.0394159];
+        for (got, want) in pre.iter().zip(want_pre) {
+            assert!((got - want).abs() < 1e-6, "pre: {got} != {want}");
+        }
+        for (got, want) in post.iter().zip(want_post) {
+            assert!((got - want).abs() < 1e-6, "post: {got} != {want}");
+        }
+    }
 }
